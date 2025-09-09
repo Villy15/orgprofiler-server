@@ -7,7 +7,6 @@ import math
 import base64
 
 api = FastAPI()
-
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -32,17 +31,36 @@ def fill_holes(binary: np.ndarray) -> np.ndarray:
     inv = cv2.bitwise_not(flood)
     return cv2.bitwise_or(binary, inv)
 
+def iso_data_threshold(gray: np.ndarray) -> int:
+    """
+    ImageJ 'Default' threshold (IsoData / iterative intermeans) using a histogram.
+    Returns an integer threshold in [0, 255].
+    """
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    nz = np.nonzero(hist)[0]
+    if nz.size == 0:
+        return 128
+    lo, hi = int(nz[0]), int(nz[-1])
+    t, prev = (lo + hi) / 2.0, -1.0
+    idx = np.arange(256, dtype=np.float64)
+
+    while abs(t - prev) >= 0.5:
+        prev = t
+        lower = idx[: int(t) + 1]
+        upper = idx[int(t) + 1 :]
+        w1 = hist[: int(t) + 1].sum()
+        w2 = hist[int(t) + 1 :].sum()
+        m1 = (hist[: int(t) + 1] * lower).sum() / w1 if w1 > 0 else 0.0
+        m2 = (hist[int(t) + 1 :] * upper).sum() / w2 if w2 > 0 else 0.0
+        t = (m1 + m2) / 2.0
+
+    return int(round(t))
+
 def feret_features(points_xy: np.ndarray):
-    """
-    Fiji-like Feret metrics.
-    points_xy: Nx2 float array (convex hull points recommended)
-    Returns: (feret_max, feret_min, feret_angle_deg, feretX, feretY)
-    """
     pts = points_xy.astype(np.float32)
     if pts.shape[0] < 2:
         return 0.0, 0.0, 0.0, 0.0, 0.0
 
-    # Max Feret (diameter) via brute-force on hull
     A = pts[:, None, :]
     d2 = np.sum((A - pts[None, :, :]) ** 2, axis=2)
     np.fill_diagonal(d2, -1.0)
@@ -50,8 +68,7 @@ def feret_features(points_xy: np.ndarray):
     feret_max = float(np.sqrt(d2[i, j]))
     feret_angle = float(np.degrees(np.arctan2(pts[j, 1] - pts[i, 1], pts[j, 0] - pts[i, 0])))
 
-    # Min Feret = short side of min-area rectangle (rotating calipers width)
-    rect = cv2.minAreaRect(pts)             # ((cx,cy),(w,h),angle)
+    rect = cv2.minAreaRect(pts)
     w_rect, h_rect = float(rect[1][0]), float(rect[1][1])
     feret_min = float(min(w_rect, h_rect))
 
@@ -60,37 +77,34 @@ def feret_features(points_xy: np.ndarray):
 @api.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
-
-    # --- Fiji-like defaults & knobs ---
-    sigma_pre: float = Query(6.4, ge=0.0),                 # Gaussian sigma before threshold
-    k: int = Query(5, ge=3),                               # morphology kernel (odd recommended)
-    dilate_iter: int = Query(4, ge=0),                     # Fiji: Dilate x4
-    erode_iter: int = Query(5, ge=0),                      # then Erode x5
-    min_area: float = Query(60000, ge=0),                  # Fiji script default
+    # Fiji-like knobs
+    sigma_pre: float = Query(6.4, ge=0.0),
+    k: int = Query(5, ge=3),
+    dilate_iter: int = Query(4, ge=0),
+    erode_iter: int = Query(5, ge=0),
+    min_area: float = Query(60000, ge=0),
     max_area: float = Query(2.0e7, ge=0),
     min_circ: float = Query(0.28, ge=0.0, le=1.0),
-    edge_margin: float = Query(0.20, ge=0.0, le=0.49),     # exclude particles near borders
-    smooth_circle: bool = Query(False)                     # optional: force circular contour
+    edge_margin: float = Query(0.20, ge=0.0, le=0.49),
 ) -> Dict[str, Any]:
 
-    # 0) Load and crop 2px border (Fiji crops to avoid border artifacts)
     data = await file.read()
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(400, "Invalid image")
 
+    # crop 2 px like Fiji
     if min(img.shape[:2]) > 8:
         img = img[2:-2, 2:-2]
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # 1) Blur like Fiji
     gray_blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma_pre, sigmaY=sigma_pre)
 
-    # 2) Threshold dark organoid (Fiji: "Default dark"; here: Otsu + INV)
-    _, core = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # ImageJ "Default" (IsoData) + dark objects
+    t = iso_data_threshold(gray_blur)
+    _, core = cv2.threshold(gray_blur, t, 255, cv2.THRESH_BINARY_INV)
 
-    # 3) Morphology sequence (Fiji order)
+    # Morphology (Fill → Dilate×4 → Fill → Erode×5 → Fill)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     core = fill_holes(core)
     if dilate_iter > 0:
@@ -100,7 +114,7 @@ async def analyze(
         core = cv2.erode(core, kernel, iterations=erode_iter)
     core = fill_holes(core)
 
-    # 4) Contours + Fiji-like filtering (area, circ, edge exclusion)
+    # Find & filter contours (Fiji-like)
     cnts, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         raise HTTPException(422, "No contours found")
@@ -130,49 +144,54 @@ async def analyze(
             continue
         candidates.append(c)
 
-    cnt = max(candidates, key=cv2.contourArea) if candidates else max(cnts, key=cv2.contourArea)
+    # ---- NEW: treat all qualified contours as a single ROI (union)
+    finals = candidates if candidates else [max(cnts, key=cv2.contourArea)]
 
-    # Optional: replace with a smooth circle (not used by Fiji, but kept as a knob)
-    if smooth_circle:
-        (ccx, ccy), r = cv2.minEnclosingCircle(cnt)
-        cnt = cv2.ellipse2Poly(center=(int(ccx), int(ccy)),
-                               axes=(int(r), int(r)), angle=0, arcStart=0, arcEnd=360, delta=1)
-        cnt = cnt.reshape(-1, 1, 2)
+    # Draw outlines for visualization (both, if present)
+    overlay = img.copy()
+    for c in finals:
+        cv2.drawContours(overlay, [c], -1, (255, 0, 255), 8)
 
-    # Final mask
+    # Build a single union mask
     mask = np.zeros_like(gray, np.uint8)
-    cv2.drawContours(mask, [cnt], -1, 255, thickness=-1)
+    cv2.drawContours(mask, finals, -1, 255, thickness=-1)
+    mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
-    # ---- Measurements (geometry)
-    area = float(cv2.contourArea(cnt))
-    perim = float(cv2.arcLength(cnt, True))
-    x, y, w, h = cv2.boundingRect(cnt)
+    # ---- Measurements on the union
+    # Area = sum of areas of all selected contours
+    area = float(sum(cv2.contourArea(c) for c in finals))
+    # Perimeter = sum of perimeters
+    perim = float(sum(cv2.arcLength(c, True) for c in finals))
+
+    # Bounding box across all points
+    all_pts = np.vstack([c.reshape(-1, 2) for c in finals])
+    x, y, w, h = cv2.boundingRect(all_pts)
     bx, by, width, height = float(x), float(y), float(w), float(h)
 
-    M = cv2.moments(cnt)
+    # Centroid from binary mask moments (robust for unions)
+    M = cv2.moments(mask, True)
     cx = float(M["m10"] / M["m00"]) if M["m00"] else 0.0
     cy = float(M["m01"] / M["m00"]) if M["m00"] else 0.0
 
+    # Ellipse fit & derived metrics using all contour points together
     major = minor = angle = 0.0
-    if len(cnt) >= 5:
-        (_, _), (eW, eH), ang = cv2.fitEllipse(cnt)
+    if all_pts.shape[0] >= 5:
+        (_, _), (eW, eH), ang = cv2.fitEllipse(all_pts.astype(np.float32))
         major, minor, angle = float(max(eW, eH)), float(min(eW, eH)), float(ang)
 
     circ = float((4.0 * math.pi * area) / (perim * perim)) if perim > 0 else 0.0
 
-    hull = cv2.convexHull(cnt)
+    # Feret etc. from convex hull of all points
+    hull = cv2.convexHull(all_pts.astype(np.float32))
     hull_area = float(cv2.contourArea(hull))
     solidity = float(area / hull_area) if hull_area > 0 else 0.0
-
-    # Proper Feret & MinFeret (use convex hull points)
     hull_pts = hull.reshape(-1, 2).astype(np.float64)
     feret, minFeret, feretAngle, feretX, feretY = feret_features(hull_pts)
 
-    # Fiji-style AR and Roundness (ellipse-based, not axis-aligned box)
     ar = float(major / minor) if minor > 0 else 0.0
     roundness = float((4.0 * area) / (math.pi * major * major)) if major > 0 else 0.0
 
-    # ---- Intensity stats on INVERTED gray (Fiji inverts brightfield)
+    # Intensity stats on inverted image over the union
     stat_img = 255 - gray
     vals = stat_img[mask > 0].astype(np.float64)
     if vals.size == 0:
@@ -194,7 +213,7 @@ async def analyze(
     rawIntDen = float(vals.sum())
     intDen = float(area * mean)
 
-    # Intensity-weighted centroid on inverted plane (XM, YM)
+    # Intensity-weighted centroid over the union
     ys, xs = np.nonzero(mask)
     weights = stat_img[ys, xs].astype(np.float64)
     wsum = float(weights.sum())
@@ -203,11 +222,6 @@ async def analyze(
         ym = float((ys * weights).sum() / wsum)
     else:
         xm, ym = cx, cy
-
-    # ---- Visuals
-    overlay = img.copy()
-    cv2.drawContours(overlay, [cnt], -1, (255, 0, 255), 8)
-    mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
     results = {
         "area": area, "mean": mean, "stdDev": stdDev, "mode": mode, "min": vmin, "max": vmax,
