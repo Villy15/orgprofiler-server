@@ -5,5 +5,5 @@
 Install dependencies:
 
 ```bash
-poetry run fastapi dev app/main.py
+poetry run fastapi dev main.py
 ```
