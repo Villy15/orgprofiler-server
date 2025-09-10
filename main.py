@@ -1,199 +1,320 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
-import numpy as np
-import cv2
-import math
+from __future__ import annotations
+
 import base64
+import io
+import math
+import os
+import subprocess
+import tempfile
+from functools import lru_cache
+from typing import Any, Dict
+
+import imagej
+import jpype
+import numpy as np
+import scyjava
+from PIL import Image
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from scipy import ndimage as ndi
+from scipy.spatial import ConvexHull
+from skimage import color, filters, measure, morphology, segmentation
 
 api = FastAPI()
+
 api.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @api.get("/")
 def index():
     return {"message": "Hello World"}
 
-def to_data_url_png(img: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".png", img)
-    if not ok:
-        raise RuntimeError("PNG encode failed")
-    return "data:image/png;base64," + base64.b64encode(buf).decode("ascii")
 
-def fill_holes(binary: np.ndarray) -> np.ndarray:
-    h, w = binary.shape[:2]
-    flood = binary.copy()
-    mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, mask, (0, 0), 255)
-    inv = cv2.bitwise_not(flood)
-    return cv2.bitwise_or(binary, inv)
+# ---------------- Fiji (PyImageJ) init: robust Java detection ----------------
 
-def iso_data_threshold(gray: np.ndarray) -> int:
+# Pin a reproducible Fiji build; override via env FIJI_COORD if desired
+FIJI_COORD = os.environ.get("FIJI_COORD", "sc.fiji:fiji:2.14.0")
+
+
+def _detect_java_home() -> str | None:
+    """Try JAVA_HOME, then macOS helper for JDK 17."""
+    jh = os.environ.get("JAVA_HOME")
+    if jh and os.path.isdir(jh):
+        return jh
+    try:
+        out = subprocess.check_output(
+            ["/usr/libexec/java_home", "-v", "17"], text=True
+        ).strip()
+        if out and os.path.isdir(out):
+            return out
+    except Exception:
+        pass
+    return None
+
+
+@lru_cache(maxsize=1)
+def _init_ij():
+    # Ensure scyjava uses a real JDK; avoid auto-fetch (buggy path)
+    java_home = _detect_java_home()
+    if not java_home:
+        raise RuntimeError(
+            "No Java detected. Install OpenJDK 17 and set JAVA_HOME, e.g.:\n"
+            "  brew install openjdk@17\n"
+            "  export JAVA_HOME=$(/usr/libexec/java_home -v 17)\n"
+        )
+    os.environ["JAVA_HOME"] = java_home
+    scyjava.config.set_java_home(java_home)
+
+    # JVM options BEFORE imagej.init()
+    scyjava.config.add_option("-Xmx4g")
+    scyjava.config.add_option("-Djava.awt.headless=true")
+    # Belt & suspenders: never fetch Java
+    os.environ.setdefault("SCYJAVA_FETCH_JAVA", "never")
+
+    # Initialize Fiji headless
+    ij = imagej.init(FIJI_COORD, mode="headless")
+    IJ = ij.py.get_jclass("ij.IJ")
+    return ij, IJ
+
+
+def get_ij():
+    ij, IJ = _init_ij()
+    # Attach FastAPI worker thread to JVM
+    if not jpype.isThreadAttachedToJVM():
+        jpype.attachThreadToJVM()
+    return ij, IJ
+
+
+# ---------------- Utilities (no OpenCV) ----------------
+
+def to_data_url_png(arr: np.ndarray) -> str:
+    """Encode HxW or HxWx3 uint8 array as PNG data URL via Pillow."""
+    a = arr
+    if a.dtype != np.uint8:
+        a = np.clip(a, 0, 255).astype(np.uint8)
+    if a.ndim == 2:
+        im = Image.fromarray(a, mode="L")
+    else:
+        im = Image.fromarray(a, mode="RGB")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def feret_features_from_points(points_xy: np.ndarray):
     """
-    ImageJ 'Default' threshold (IsoData / iterative intermeans) using a histogram.
-    Returns an integer threshold in [0, 255].
+    Feret max/min via convex hull.
+    points_xy: Nx2 (x, y) float
+    Returns: (feret_max, minFeret, feret_angle_deg, feretX, feretY)
     """
-    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
-    nz = np.nonzero(hist)[0]
-    if nz.size == 0:
-        return 128
-    lo, hi = int(nz[0]), int(nz[-1])
-    t, prev = (lo + hi) / 2.0, -1.0
-    idx = np.arange(256, dtype=np.float64)
-
-    while abs(t - prev) >= 0.5:
-        prev = t
-        lower = idx[: int(t) + 1]
-        upper = idx[int(t) + 1 :]
-        w1 = hist[: int(t) + 1].sum()
-        w2 = hist[int(t) + 1 :].sum()
-        m1 = (hist[: int(t) + 1] * lower).sum() / w1 if w1 > 0 else 0.0
-        m2 = (hist[int(t) + 1 :] * upper).sum() / w2 if w2 > 0 else 0.0
-        t = (m1 + m2) / 2.0
-
-    return int(round(t))
-
-def feret_features(points_xy: np.ndarray):
-    pts = points_xy.astype(np.float32)
-    if pts.shape[0] < 2:
+    if points_xy.shape[0] < 2:
         return 0.0, 0.0, 0.0, 0.0, 0.0
 
-    A = pts[:, None, :]
-    d2 = np.sum((A - pts[None, :, :]) ** 2, axis=2)
-    np.fill_diagonal(d2, -1.0)
-    i, j = np.unravel_index(np.argmax(d2), d2.shape)
-    feret_max = float(np.sqrt(d2[i, j]))
-    feret_angle = float(np.degrees(np.arctan2(pts[j, 1] - pts[i, 1], pts[j, 0] - pts[i, 0])))
+    hull = ConvexHull(points_xy)
+    H = points_xy[hull.vertices]  # Kx2 ordered hull
 
-    rect = cv2.minAreaRect(pts)
-    w_rect, h_rect = float(rect[1][0]), float(rect[1][1])
-    feret_min = float(min(w_rect, h_rect))
+    # Max Feret (diameter) on hull
+    d2max, i_best, j_best = 0.0, 0, 0
+    for i in range(len(H)):
+        for j in range(i + 1, len(H)):
+            dx, dy = H[j, 0] - H[i, 0], H[j, 1] - H[i, 1]
+            d2 = dx * dx + dy * dy
+            if d2 > d2max:
+                d2max, i_best, j_best = d2, i, j
+    feret_max = math.sqrt(d2max)
+    feret_angle = math.degrees(math.atan2(H[j_best, 1] - H[i_best, 1], H[j_best, 0] - H[i_best, 0]))
+    feretX, feretY = float(H[i_best, 0]), float(H[i_best, 1])
 
-    return feret_max, feret_min, feret_angle, float(pts[i, 0]), float(pts[i, 1])
+    # Min Feret = minimum width across hull edges
+    def width_for_edge(p0, p1):
+        ux, uy = p1 - p0
+        L = math.hypot(float(ux), float(uy))
+        if L == 0:
+            return float("inf")
+        nx, ny = -uy / L, ux / L
+        projs = H @ np.array([nx, ny], dtype=float)
+        return float(projs.max() - projs.min())
+
+    min_width = float("inf")
+    for i in range(len(H)):
+        p0, p1 = H[i], H[(i + 1) % len(H)]
+        w = width_for_edge(p0, p1)
+        if w < min_width:
+            min_width = w
+
+    return float(feret_max), float(min_width), float(feret_angle), feretX, feretY
+
+
+# ---------------- Analyze endpoint ----------------
 
 @api.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
+
     # Fiji-like knobs
-    sigma_pre: float = Query(6.4, ge=0.0),
-    k: int = Query(5, ge=3),
-    dilate_iter: int = Query(4, ge=0),
-    erode_iter: int = Query(5, ge=0),
-    min_area: float = Query(60000, ge=0),
+    sigma_pre: float = Query(6.4, ge=0.0),          # Gaussian blur sigma
+    dilate_iter: int = Query(4, ge=0),              # Dilate x N
+    erode_iter: int = Query(5, ge=0),               # Erode x M
+    min_area: float = Query(60000, ge=0),           # area bounds
     max_area: float = Query(2.0e7, ge=0),
-    min_circ: float = Query(0.28, ge=0.0, le=1.0),
-    edge_margin: float = Query(0.20, ge=0.0, le=0.49),
+    min_circ: float = Query(0.28, ge=0.0, le=1.0),  # circularity filter
+    edge_margin: float = Query(0.20, ge=0.0, le=0.49),  # exclude centroids near borders
 ) -> Dict[str, Any]:
 
+    # Load RGB image (uint8)
     data = await file.read()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
+    try:
+        img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+    except Exception:
         raise HTTPException(400, "Invalid image")
 
-    # crop 2 px like Fiji
+    # Crop 2px border to avoid edge artifacts
     if min(img.shape[:2]) > 8:
-        img = img[2:-2, 2:-2]
+        img = img[2:-2, 2:-2, :]
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray_blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma_pre, sigmaY=sigma_pre)
+    H, W, _ = img.shape
 
-    # ImageJ "Default" (IsoData) + dark objects
-    t = iso_data_threshold(gray_blur)
-    _, core = cv2.threshold(gray_blur, t, 255, cv2.THRESH_BINARY_INV)
+    # -------- Try Fiji (preferred) --------
+    USE_FIJI = True
+    try:
+        ij, IJ = get_ij()
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                Image.fromarray(img).save(tmp.name)
+                tmp_path = tmp.name
 
-    # Morphology (Fill → Dilate×4 → Fill → Erode×5 → Fill)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    core = fill_holes(core)
-    if dilate_iter > 0:
-        core = cv2.dilate(core, kernel, iterations=dilate_iter)
-    core = fill_holes(core)
-    if erode_iter > 0:
-        core = cv2.erode(core, kernel, iterations=erode_iter)
-    core = fill_holes(core)
+            imp = IJ.openImage(tmp_path)
+            if imp is None:
+                raise RuntimeError("ImageJ failed to open image")
 
-    # Find & filter contours (Fiji-like)
-    cnts, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
+            IJ.run(imp, "8-bit", "")
+            IJ.run(imp, "Gaussian Blur...", f"sigma={sigma_pre}")
+            IJ.run(imp, "Make Binary", "method=Default background=Dark")
+            IJ.run(imp, "Fill Holes", "")
+            for _ in range(int(dilate_iter)):
+                IJ.run(imp, "Dilate", "")
+            IJ.run(imp, "Fill Holes", "")
+            for _ in range(int(erode_iter)):
+                IJ.run(imp, "Erode", "")
+            IJ.run(imp, "Fill Holes", "")
+
+            mask_u8 = ij.py.from_java(imp)
+            if mask_u8.ndim != 2:
+                mask_u8 = mask_u8[..., 0]
+            mask_bool = mask_u8 > 0
+        finally:
+            try:
+                if "imp" in locals() and imp is not None:
+                    imp.close()
+            except Exception:
+                pass
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+    except Exception:
+        # Fall back to scikit-image if Fiji init or processing fails
+        USE_FIJI = False
+        print("Fiji failed, falling back to scikit-image")
+        # Gray (0..255)
+        gray = (color.rgb2gray(img) * 255.0).astype(np.uint8)
+        # Gaussian blur
+        gray_blur = filters.gaussian(gray, sigma=sigma_pre, preserve_range=True)
+        # IsoData (ImageJ Default) threshold; dark objects
+        t = float(filters.threshold_isodata(gray_blur.astype(np.uint8)))
+        core = gray_blur <= t
+        # Morphology: Fill → Dilate×d → Fill → Erode×e → Fill
+        selem = morphology.disk(max(1, int(max(1, round(0.5 * 5)))))  # approx k=5 ellipse
+        core = ndi.binary_fill_holes(core)
+        for _ in range(int(dilate_iter)):
+            core = morphology.binary_dilation(core, selem)
+        core = ndi.binary_fill_holes(core)
+        for _ in range(int(erode_iter)):
+            core = morphology.binary_erosion(core, selem)
+        core = ndi.binary_fill_holes(core)
+        mask_bool = core
+
+    # -------- Filter regions (area, circularity, edge), then UNION --------
+    labels = measure.label(mask_bool, connectivity=2)
+    if labels.max() == 0:
         raise HTTPException(422, "No contours found")
 
-    H, W = gray.shape
     xmin, xmax = W * edge_margin, W * (1.0 - edge_margin)
     ymin, ymax = H * edge_margin, H * (1.0 - edge_margin)
 
-    def circ_of(c):
-        a = cv2.contourArea(c)
-        p = cv2.arcLength(c, True)
-        return ((4.0 * math.pi * a) / (p * p)) if p > 0 else 0.0
-
-    candidates = []
-    for c in cnts:
-        a = cv2.contourArea(c)
+    keep_mask = np.zeros_like(labels, dtype=bool)
+    for r in measure.regionprops(labels):
+        a = float(r.area)
         if a < min_area or a > max_area:
             continue
-        if circ_of(c) < min_circ:
+        p = float(r.perimeter) if r.perimeter > 0 else 0.0
+        circ = (4.0 * math.pi * a) / (p * p) if p > 0 else 0.0
+        if circ < min_circ:
             continue
-        M = cv2.moments(c)
-        if M["m00"] == 0:
+        cy, cx = r.centroid  # (row, col)
+        if not (xmin <= cx <= xmax and ymin <= cy <= ymax):
             continue
-        cx_c = M["m10"] / M["m00"]
-        cy_c = M["m01"] / M["m00"]
-        if (cx_c < xmin) or (cx_c > xmax) or (cy_c < ymin) or (cy_c > ymax):
-            continue
-        candidates.append(c)
+        keep_mask |= labels == r.label
 
-    # ---- NEW: treat all qualified contours as a single ROI (union)
-    finals = candidates if candidates else [max(cnts, key=cv2.contourArea)]
+    if not keep_mask.any():
+        # Fallback: keep the largest region
+        largest = max(measure.regionprops(labels), key=lambda rr: rr.area)
+        keep_mask = labels == largest.label
 
-    # Draw outlines for visualization (both, if present)
+    # -------- Visual overlays --------
+    boundaries = segmentation.find_boundaries(keep_mask, mode="outer")
+    boundaries = morphology.binary_dilation(boundaries, morphology.disk(2))
     overlay = img.copy()
-    for c in finals:
-        cv2.drawContours(overlay, [c], -1, (255, 0, 255), 8)
+    overlay[boundaries] = np.array([255, 0, 255], dtype=np.uint8)
 
-    # Build a single union mask
-    mask = np.zeros_like(gray, np.uint8)
-    cv2.drawContours(mask, finals, -1, 255, thickness=-1)
-    mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    mask_vis = np.zeros_like(img, dtype=np.uint8)
+    mask_vis[keep_mask] = 255
 
-    # ---- Measurements on the union
-    # Area = sum of areas of all selected contours
-    area = float(sum(cv2.contourArea(c) for c in finals))
-    # Perimeter = sum of perimeters
-    perim = float(sum(cv2.arcLength(c, True) for c in finals))
+    # -------- Measurements on union (single ROI) --------
+    union_lab = measure.label(keep_mask, connectivity=2)
+    union_props = measure.regionprops(union_lab)[0]
 
-    # Bounding box across all points
-    all_pts = np.vstack([c.reshape(-1, 2) for c in finals])
-    x, y, w, h = cv2.boundingRect(all_pts)
-    bx, by, width, height = float(x), float(y), float(w), float(h)
+    area = float(union_props.area)
+    perim = float(measure.perimeter(keep_mask))
+    minr, minc, maxr, maxc = union_props.bbox
+    bx, by, width, height = float(minc), float(minr), float(maxc - minc), float(maxr - minr)
 
-    # Centroid from binary mask moments (robust for unions)
-    M = cv2.moments(mask, True)
-    cx = float(M["m10"] / M["m00"]) if M["m00"] else 0.0
-    cy = float(M["m01"] / M["m00"]) if M["m00"] else 0.0
+    cy, cx = union_props.centroid
+    cx, cy = float(cx), float(cy)
 
-    # Ellipse fit & derived metrics using all contour points together
-    major = minor = angle = 0.0
-    if all_pts.shape[0] >= 5:
-        (_, _), (eW, eH), ang = cv2.fitEllipse(all_pts.astype(np.float32))
-        major, minor, angle = float(max(eW, eH)), float(min(eW, eH)), float(ang)
+    major = float(union_props.major_axis_length or 0.0)
+    minor = float(union_props.minor_axis_length or 0.0)
+    angle = float(np.degrees(union_props.orientation or 0.0))
 
-    circ = float((4.0 * math.pi * area) / (perim * perim)) if perim > 0 else 0.0
+    circ = (4.0 * math.pi * area) / (perim * perim) if perim > 0 else 0.0
 
-    # Feret etc. from convex hull of all points
-    hull = cv2.convexHull(all_pts.astype(np.float32))
-    hull_area = float(cv2.contourArea(hull))
+    # Convex hull for solidity
+    hull_img = morphology.convex_hull_image(keep_mask)
+    hull_area = float(hull_img.sum())
     solidity = float(area / hull_area) if hull_area > 0 else 0.0
-    hull_pts = hull.reshape(-1, 2).astype(np.float64)
-    feret, minFeret, feretAngle, feretX, feretY = feret_features(hull_pts)
+
+    # Feret from union points (x=col, y=row)
+    ys, xs = np.nonzero(keep_mask)
+    pts = np.column_stack((xs.astype(float), ys.astype(float)))
+    if pts.shape[0] >= 3:
+        feret, minFeret, feretAngle, feretX, feretY = feret_features_from_points(pts)
+    else:
+        feret = minFeret = feretAngle = feretX = feretY = 0.0
 
     ar = float(major / minor) if minor > 0 else 0.0
     roundness = float((4.0 * area) / (math.pi * major * major)) if major > 0 else 0.0
 
-    # Intensity stats on inverted image over the union
-    stat_img = 255 - gray
-    vals = stat_img[mask > 0].astype(np.float64)
+    # Intensity stats on inverted gray (brightfield style)
+    gray_u8 = (color.rgb2gray(img) * 255.0).astype(np.uint8)
+    stat_img = 255 - gray_u8
+    vals = stat_img[keep_mask].astype(float)
     if vals.size == 0:
         raise HTTPException(422, "Empty ROI after masking")
 
@@ -213,15 +334,9 @@ async def analyze(
     rawIntDen = float(vals.sum())
     intDen = float(area * mean)
 
-    # Intensity-weighted centroid over the union
-    ys, xs = np.nonzero(mask)
-    weights = stat_img[ys, xs].astype(np.float64)
-    wsum = float(weights.sum())
-    if wsum > 0:
-        xm = float((xs * weights).sum() / wsum)
-        ym = float((ys * weights).sum() / wsum)
-    else:
-        xm, ym = cx, cy
+    # Intensity-weighted centroid (XM, YM)
+    ym, xm = ndi.center_of_mass(stat_img, labels=keep_mask.astype(np.uint8), index=1)
+    xm, ym = float(xm), float(ym)
 
     results = {
         "area": area, "mean": mean, "stdDev": stdDev, "mode": mode, "min": vmin, "max": vmax,
@@ -231,6 +346,7 @@ async def analyze(
         "kurt": kurt, "rawIntDen": rawIntDen, "feretX": feretX, "feretY": feretY,
         "feretAngle": feretAngle, "minFeret": minFeret, "ar": ar, "round": roundness,
         "solidity": solidity,
+        "usedFiji": USE_FIJI,  # FYI: tells you if Fiji was used this request
     }
 
     return {
