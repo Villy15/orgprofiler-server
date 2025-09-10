@@ -6,6 +6,7 @@ import math
 import os
 import subprocess
 import tempfile
+import traceback
 from functools import lru_cache
 from typing import Any, Dict
 
@@ -35,58 +36,85 @@ def index():
     return {"message": "Hello World"}
 
 
-# ---------------- Fiji (PyImageJ) init: robust Java detection ----------------
+# ---------------- Logging helpers ----------------
 
-# Pin a reproducible Fiji build; override via env FIJI_COORD if desired
-FIJI_COORD = os.environ.get("FIJI_COORD", "sc.fiji:fiji:2.14.0")
+def log(msg: str) -> None:
+    # Simple, consistent prefix to grep easily
+    print(f"[IJ] {msg}", flush=True)
 
+def java_stacktrace(jexc) -> str:
+    """Return full Java stack trace for a jpype.JException."""
+    try:
+        StringWriter = scyjava.jimport("java.io.StringWriter")
+        PrintWriter = scyjava.jimport("java.io.PrintWriter")
+        sw = StringWriter()
+        pw = PrintWriter(sw)
+        jexc.printStackTrace(pw)
+        pw.flush()
+        return str(sw.toString())
+    except Exception:
+        # Fallback: Python repr plus any attached info
+        return f"{repr(jexc)}"
+
+
+# ---------------- PyImageJ init ----------------
+
+# Default to ImageJ core to avoid JS scripting plugin errors on modern JDKs.
+# If you want full Fiji, export: IMAGEJ_COORD=sc.fiji:fiji:2.14.0
+IMAGEJ_COORD = os.environ.get("IMAGEJ_COORD", "net.imagej:imagej:2.14.0")
+SCIJAVA_LOG_LEVEL = os.environ.get("SCIJAVA_LOG_LEVEL", "debug")  # debug|info|warn|error|none
 
 def _detect_java_home() -> str | None:
-    """Try JAVA_HOME, then macOS helper for JDK 17."""
+    """Prefer an existing JAVA_HOME, otherwise ask macOS for JDK 17 then 11."""
     jh = os.environ.get("JAVA_HOME")
     if jh and os.path.isdir(jh):
         return jh
-    try:
-        out = subprocess.check_output(
-            ["/usr/libexec/java_home", "-v", "17"], text=True
-        ).strip()
-        if out and os.path.isdir(out):
-            return out
-    except Exception:
-        pass
+    for v in ("17", "11"):
+        try:
+            out = subprocess.check_output(["/usr/libexec/java_home", "-v", v], text=True).strip()
+            if out and os.path.isdir(out):
+                return out
+        except Exception:
+            pass
     return None
-
 
 @lru_cache(maxsize=1)
 def _init_ij():
-    # Ensure scyjava uses a real JDK; avoid auto-fetch (buggy path)
     java_home = _detect_java_home()
+    log("Initializing ImageJ...")
+    log(f"Using JAVA_HOME: {java_home}")
     if not java_home:
         raise RuntimeError(
             "No Java detected. Install OpenJDK 17 and set JAVA_HOME, e.g.:\n"
             "  brew install openjdk@17\n"
+            "  sudo mkdir -p /Library/Java/JavaVirtualMachines && "
+            "  sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk "
+            "               /Library/Java/JavaVirtualMachines/openjdk-17.jdk\n"
             "  export JAVA_HOME=$(/usr/libexec/java_home -v 17)\n"
         )
     os.environ["JAVA_HOME"] = java_home
-    scyjava.config.set_java_home(java_home)
+    os.environ.setdefault("SCYJAVA_FETCH_JAVA", "never")  # avoid buggy auto-fetch path
 
     # JVM options BEFORE imagej.init()
     scyjava.config.add_option("-Xmx4g")
     scyjava.config.add_option("-Djava.awt.headless=true")
-    # Belt & suspenders: never fetch Java
-    os.environ.setdefault("SCYJAVA_FETCH_JAVA", "never")
+    scyjava.config.add_option(f"-Dscijava.log.level={SCIJAVA_LOG_LEVEL}")
 
-    # Initialize Fiji headless
-    ij = imagej.init(FIJI_COORD, mode="headless")
-    IJ = ij.py.get_jclass("ij.IJ")
+    log("Starting JVM...")
+    ij = imagej.init(IMAGEJ_COORD, mode="headless")
+    log(f"ImageJ version: {ij.getVersion()}")
+    log("JVM started.")
+
+    # IJ1 gateway for IJ.run(...) commands
+    IJ = scyjava.jimport("ij.IJ")
     return ij, IJ
-
 
 def get_ij():
     ij, IJ = _init_ij()
-    # Attach FastAPI worker thread to JVM
+    # Attach the current worker thread to the JVM
     if not jpype.isThreadAttachedToJVM():
         jpype.attachThreadToJVM()
+        log("Attached current thread to JVM.")
     return ij, IJ
 
 
@@ -170,86 +198,162 @@ async def analyze(
     data = await file.read()
     try:
         img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+        log(f"Received image shape={img.shape} dtype={img.dtype}")
     except Exception:
+        log("Failed to open uploaded image with Pillow.")
         raise HTTPException(400, "Invalid image")
 
     # Crop 2px border to avoid edge artifacts
     if min(img.shape[:2]) > 8:
         img = img[2:-2, 2:-2, :]
+        log(f"Cropped 2px border. New shape={img.shape}")
 
     H, W, _ = img.shape
 
-    # -------- Try Fiji (preferred) --------
+    # -------- Try ImageJ (preferred) --------
     USE_FIJI = True
     try:
         ij, IJ = get_ij()
         tmp_path = None
+        imp = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 Image.fromarray(img).save(tmp.name)
                 tmp_path = tmp.name
+            log(f"Saved temp PNG for IJ at: {tmp_path}")
 
+            # Open in IJ1
             imp = IJ.openImage(tmp_path)
             if imp is None:
+                log("IJ.openImage returned None.")
                 raise RuntimeError("ImageJ failed to open image")
 
-            IJ.run(imp, "8-bit", "")
-            IJ.run(imp, "Gaussian Blur...", f"sigma={sigma_pre}")
-            IJ.run(imp, "Make Binary", "method=Default background=Dark")
-            IJ.run(imp, "Fill Holes", "")
-            for _ in range(int(dilate_iter)):
-                IJ.run(imp, "Dilate", "")
-            IJ.run(imp, "Fill Holes", "")
-            for _ in range(int(erode_iter)):
-                IJ.run(imp, "Erode", "")
-            IJ.run(imp, "Fill Holes", "")
+            w, h, bd = imp.getWidth(), imp.getHeight(), imp.getBitDepth()
+            log(f"Opened ImagePlus: size=({w}x{h}), bitDepth={bd}, title='{imp.getTitle()}'")
 
-            mask_u8 = ij.py.from_java(imp)
-            if mask_u8.ndim != 2:
-                mask_u8 = mask_u8[..., 0]
+            # Processing chain with per-step logs
+            log("Running '8-bit'...")
+            IJ.run(imp, "8-bit", "")
+            log(f"After '8-bit': bitDepth={imp.getBitDepth()}")
+
+            log(f"Running 'Gaussian Blur...' sigma={sigma_pre} ...")
+            IJ.run(imp, "Gaussian Blur...", f"sigma={sigma_pre}")
+            log("After Gaussian Blur.")
+
+            log("Running 'Make Binary' (Default, Dark)...")
+            IJ.run(imp, "Make Binary", "method=Default background=Dark")
+            log("After Make Binary.")
+
+            log("Running 'Fill Holes'...")
+            IJ.run(imp, "Fill Holes", "")
+            log("After Fill Holes.")
+
+            for i in range(int(dilate_iter)):
+                log(f"Dilate iter {i+1}/{dilate_iter} ...")
+                IJ.run(imp, "Dilate", "")
+            log("After Dilate loop.")
+
+            log("Running 'Fill Holes' again...")
+            IJ.run(imp, "Fill Holes", "")
+            log("After second Fill Holes.")
+
+            for i in range(int(erode_iter)):
+                log(f"Erode iter {i+1}/{erode_iter} ...")
+                IJ.run(imp, "Erode", "")
+            log("After Erode loop.")
+
+            log("Running 'Fill Holes' final...")
+            IJ.run(imp, "Fill Holes", "")
+            log("After final Fill Holes.")
+
+            # Convert Java -> NumPy
+            log("Converting ImagePlus to NumPy via ij.py.from_java(imp)...")
+            try:
+                mask_u8 = ij.py.from_java(imp)
+                log(f"from_java(imp) returned array with shape={getattr(mask_u8, 'shape', None)}, dtype={getattr(mask_u8, 'dtype', None)}")
+            except Exception as e_conv:
+                log("from_java(imp) failed, attempting pixel-array fallback...")
+                # Fallback: grab raw pixels from processor and reshape
+                try:
+                    ip = imp.getProcessor()
+                    if ip is None:
+                        raise RuntimeError("ImageProcessor is None")
+                    w, h = imp.getWidth(), imp.getHeight()
+                    jarr = ip.getPixels()  # Java primitive array
+                    np1d = np.asarray(ij.py.from_java(jarr))
+                    mask_u8 = np1d.reshape((h, w))
+                    log(f"Fallback pixels -> numpy shape={mask_u8.shape}, dtype={mask_u8.dtype}")
+                except Exception as e_fb:
+                    log("Pixel-array fallback failed.")
+                    log("Python traceback:\n" + traceback.format_exc())
+                    if isinstance(e_fb, jpype.JException):
+                        log("Java stack:\n" + java_stacktrace(e_fb))
+                    raise
+
+            # Ensure 2D
+            if getattr(mask_u8, "ndim", 0) != 2:
+                log("Result not 2D; squeezing/first-channel as needed.")
+                if getattr(mask_u8, "ndim", 0) >= 3:
+                    mask_u8 = mask_u8[..., 0]
+                else:
+                    raise RuntimeError(f"Unexpected array ndim={getattr(mask_u8,'ndim',None)}")
+
+            # Build boolean mask
             mask_bool = mask_u8 > 0
+            log(f"Mask built. True pixels={int(mask_bool.sum())} / {mask_bool.size}")
+
         finally:
             try:
-                if "imp" in locals() and imp is not None:
+                if imp is not None:
                     imp.close()
+                    log("Closed ImagePlus.")
             except Exception:
-                pass
+                log("Failed to close ImagePlus (ignored).")
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
+                    log(f"Deleted temp file: {tmp_path}")
                 except Exception:
-                    pass
-    except Exception:
-        # Fall back to scikit-image if Fiji init or processing fails
+                    log("Failed to delete temp file (ignored).")
+
+    except Exception as e:
+        # Log the precise failure cause
         USE_FIJI = False
-        print("Fiji failed, falling back to scikit-image")
-        # Gray (0..255)
+        log("ImageJ path FAILED; falling back to scikit-image.")
+        log("Python traceback:\n" + traceback.format_exc())
+        if isinstance(e, jpype.JException):
+            log("Java stack:\n" + java_stacktrace(e))
+
+        # ---- scikit-image fallback (instrumented) ----
         gray = (color.rgb2gray(img) * 255.0).astype(np.uint8)
-        # Gaussian blur
+        log("Fallback: gray image computed.")
         gray_blur = filters.gaussian(gray, sigma=sigma_pre, preserve_range=True)
-        # IsoData (ImageJ Default) threshold; dark objects
+        log("Fallback: gaussian blur done.")
         t = float(filters.threshold_isodata(gray_blur.astype(np.uint8)))
+        log(f"Fallback: IsoData threshold={t:.2f}")
         core = gray_blur <= t
-        # Morphology: Fill → Dilate×d → Fill → Erode×e → Fill
-        selem = morphology.disk(max(1, int(max(1, round(0.5 * 5)))))  # approx k=5 ellipse
+        selem = morphology.disk(max(1, int(max(1, round(0.5 * 5)))))
         core = ndi.binary_fill_holes(core)
-        for _ in range(int(dilate_iter)):
+        for i in range(int(dilate_iter)):
             core = morphology.binary_dilation(core, selem)
         core = ndi.binary_fill_holes(core)
-        for _ in range(int(erode_iter)):
+        for i in range(int(erode_iter)):
             core = morphology.binary_erosion(core, selem)
         core = ndi.binary_fill_holes(core)
         mask_bool = core
+        log(f"Fallback: mask true pixels={int(mask_bool.sum())}/{mask_bool.size}")
 
     # -------- Filter regions (area, circularity, edge), then UNION --------
     labels = measure.label(mask_bool, connectivity=2)
     if labels.max() == 0:
+        log("No labeled regions found after mask.")
         raise HTTPException(422, "No contours found")
 
     xmin, xmax = W * edge_margin, W * (1.0 - edge_margin)
     ymin, ymax = H * edge_margin, H * (1.0 - edge_margin)
 
     keep_mask = np.zeros_like(labels, dtype=bool)
+    kept = 0
     for r in measure.regionprops(labels):
         a = float(r.area)
         if a < min_area or a > max_area:
@@ -262,11 +366,13 @@ async def analyze(
         if not (xmin <= cx <= xmax and ymin <= cy <= ymax):
             continue
         keep_mask |= labels == r.label
+        kept += 1
+    log(f"Filtered regions kept: {kept}")
 
     if not keep_mask.any():
-        # Fallback: keep the largest region
         largest = max(measure.regionprops(labels), key=lambda rr: rr.area)
         keep_mask = labels == largest.label
+        log(f"No regions passed filters; used largest region (area={largest.area}).")
 
     # -------- Visual overlays --------
     boundaries = segmentation.find_boundaries(keep_mask, mode="outer")
@@ -316,6 +422,7 @@ async def analyze(
     stat_img = 255 - gray_u8
     vals = stat_img[keep_mask].astype(float)
     if vals.size == 0:
+        log("Empty ROI after masking.")
         raise HTTPException(422, "Empty ROI after masking")
 
     mean = float(vals.mean())
@@ -346,7 +453,7 @@ async def analyze(
         "kurt": kurt, "rawIntDen": rawIntDen, "feretX": feretX, "feretY": feretY,
         "feretAngle": feretAngle, "minFeret": minFeret, "ar": ar, "round": roundness,
         "solidity": solidity,
-        "usedFiji": USE_FIJI,  # FYI: tells you if Fiji was used this request
+        "usedFiji": USE_FIJI,  # True if ImageJ path succeeded this request
     }
 
     return {
