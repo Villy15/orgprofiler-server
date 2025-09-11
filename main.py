@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64, io, logging, math, os, subprocess, tempfile
 from functools import lru_cache
 from typing import Any, Dict
+import cjdk 
 
 import imagej
 import jpype
@@ -48,17 +49,18 @@ if not log.handlers:
 IMAGEJ_COORD = os.environ.get("IMAGEJ_COORD", "net.imagej:imagej:2.14.0")
 
 def _detect_java_home() -> str | None:
+    """Prefer existing JAVA_HOME; else install a JDK 17 into the app dir."""
     jh = os.environ.get("JAVA_HOME")
     if jh and os.path.isdir(jh):
         return jh
-    for v in ("17", "11"):
-        try:
-            out = subprocess.check_output(["/usr/libexec/java_home", "-v", v], text=True).strip()
-            if out and os.path.isdir(out):
-                return out
-        except Exception:
-            pass
-    return None
+    try:
+        jh = cjdk.install("17", vendor="temurin")  # downloads a JDK tarball, returns path
+        os.environ["JAVA_HOME"] = jh
+        os.environ["PATH"] = f"{jh}/bin:" + os.environ.get("PATH", "")
+        return jh
+    except Exception:
+        logging.exception("Failed to install JDK with cjdk")
+        return None
 
 @lru_cache(maxsize=1)
 def _init_ij():
@@ -66,17 +68,14 @@ def _init_ij():
     log.info("Initializing ImageJ…")
     log.info("Using JAVA_HOME: %s", java_home)
     if not java_home:
-        raise RuntimeError("No Java detected. Install OpenJDK 17 or 11 and set JAVA_HOME.")
-    os.environ["JAVA_HOME"] = java_home
-    os.environ.setdefault("SCYJAVA_FETCH_JAVA", "never")
+        raise RuntimeError("No Java detected and auto-install failed.")
 
-    scyjava.config.add_option("-Xmx4g")
+    os.environ.setdefault("SCYJAVA_FETCH_JAVA", "never")  # we provide Java ourselves
     scyjava.config.add_option("-Djava.awt.headless=true")
+    scyjava.config.add_option("-Xmx1g")
 
-    log.info("Starting JVM… (coord=%s)", IMAGEJ_COORD)
-    ij = imagej.init(IMAGEJ_COORD, mode="headless")
+    ij = imagej.init(os.environ.get("IMAGEJ_COORD", "net.imagej:imagej:2.14.0"), mode="headless")
     log.info("ImageJ version: %s", ij.getVersion())
-
     IJ = jimport("ij.IJ")
     return ij, IJ
 
