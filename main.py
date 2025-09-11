@@ -1,16 +1,13 @@
 # main.py
 from __future__ import annotations
 
-import base64, io, logging, math, os, subprocess, tempfile
-from functools import lru_cache
+import base64
+import io
+import logging
+import math
 from typing import Any, Dict
-import cjdk 
 
-import imagej
-import jpype
 import numpy as np
-import scyjava
-from scyjava import jimport
 from PIL import Image
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,8 +23,10 @@ from skimage.measure import perimeter_crofton  # perimeter closer to ImageJ
 api = FastAPI()
 api.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @api.get("/")
@@ -40,50 +39,6 @@ def index():
 log = logging.getLogger("orgprofiler")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-# -----------------------------------------------------------------------------
-# PyImageJ init
-# -----------------------------------------------------------------------------
-# Default to core ImageJ (clean with JDK 11/17). For full Fiji, set:
-#   export IMAGEJ_COORD='sc.fiji:fiji:2.14.0'
-IMAGEJ_COORD = os.environ.get("IMAGEJ_COORD", "net.imagej:imagej:2.14.0")
-
-def _detect_java_home() -> str | None:
-    """Prefer existing JAVA_HOME; else install a JDK 17 into the app dir."""
-    jh = os.environ.get("JAVA_HOME")
-    if jh and os.path.isdir(jh):
-        return jh
-    try:
-        jh = cjdk.install("17", vendor="temurin")  # downloads a JDK tarball, returns path
-        os.environ["JAVA_HOME"] = jh
-        os.environ["PATH"] = f"{jh}/bin:" + os.environ.get("PATH", "")
-        return jh
-    except Exception:
-        logging.exception("Failed to install JDK with cjdk")
-        return None
-
-@lru_cache(maxsize=1)
-def _init_ij():
-    java_home = _detect_java_home()
-    log.info("Initializing ImageJ…")
-    log.info("Using JAVA_HOME: %s", java_home)
-    if not java_home:
-        raise RuntimeError("No Java detected and auto-install failed.")
-
-    os.environ.setdefault("SCYJAVA_FETCH_JAVA", "never")  # we provide Java ourselves
-    scyjava.config.add_option("-Djava.awt.headless=true")
-    scyjava.config.add_option("-Xmx1g")
-
-    ij = imagej.init(os.environ.get("IMAGEJ_COORD", "net.imagej:imagej:2.14.0"), mode="headless")
-    log.info("ImageJ version: %s", ij.getVersion())
-    IJ = jimport("ij.IJ")
-    return ij, IJ
-
-def get_ij():
-    ij, IJ = _init_ij()
-    if not jpype.isThreadAttachedToJVM():
-        jpype.attachThreadToJVM()
-    return ij, IJ
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -140,19 +95,32 @@ def feret_features_from_points(points_xy: np.ndarray):
     return float(feret_max), float(min_width), float(feret_angle), feretX, feretY
 
 def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int, erode_iter: int) -> np.ndarray:
-    """Reproduce Fiji macro: threshold -> fill/dilate/erode/fill -> blur(mask) -> threshold(dark)."""
+    """
+    Scikit-image reproduction of the Fiji macro path:
+      1) Threshold (Default) on 8-bit gray -> dark core
+      2) Fill / Dilate^n / Fill / Erode^m / Fill
+      3) Gaussian Blur (sigma = sigma_pre)
+      4) Auto-threshold again with 'Default dark' semantics
+    """
     gray = rgb_to_gray_ij_u8(img_rgb)
+
+    # Step 1: initial threshold (assume darker organoid)
     t1 = filters.threshold_isodata(gray)
     core = gray <= t1
     core = ndi.binary_fill_holes(core)
+
+    # Morphology: dilate, fill, erode, fill
     se = square(3)
     for _ in range(int(dilate_iter)):
-        core = morphology.binary_dilation(core, se)
+        core = morphology.binary_dilation(core, selem=se)
     core = ndi.binary_fill_holes(core)
     for _ in range(int(erode_iter)):
-        core = morphology.binary_erosion(core, se)
+        core = morphology.binary_erosion(core, selem=se)
     core = ndi.binary_fill_holes(core)
+
+    # Blur the mask-like core, then threshold "dark"
     soft = filters.gaussian(core.astype(float), sigma=sigma_pre, preserve_range=True)
+    # Normalize to 0..1 already; pick threshold on 0..255 scale like IJ then scale back
     t2 = filters.threshold_isodata((soft * 255).astype(np.uint8)) / 255.0
     final = soft <= t2
     return final
@@ -188,58 +156,14 @@ async def analyze(
 
     H, W, _ = img.shape
 
-    # ---------- Build mask (prefer ImageJ) ----------
-    used_ij = True
-    try:
-        ij, IJ = get_ij()
-        tmp_path, imp = None, None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                Image.fromarray(img).save(tmp.name)
-                tmp_path = tmp.name
-
-            imp = IJ.openImage(tmp_path)
-            if imp is None:
-                raise RuntimeError("IJ.openImage returned None")
-
-            IJ.run(imp, "8-bit", "")
-            IJ.setAutoThreshold(imp, "Default")
-            IJ.run(imp, "Convert to Mask", "")
-            IJ.run(imp, "Fill Holes", "")
-            for _ in range(int(dilate_iter)):
-                IJ.run(imp, "Dilate", "")
-            IJ.run(imp, "Fill Holes", "")
-            for _ in range(int(erode_iter)):
-                IJ.run(imp, "Erode", "")
-            IJ.run(imp, "Fill Holes", "")
-            IJ.run(imp, "Gaussian Blur...", f"sigma={sigma_pre}")
-            IJ.setAutoThreshold(imp, "Default dark")
-            IJ.run(imp, "Convert to Mask", "")
-
-            mask_u8 = ij.py.from_java(imp)
-            if mask_u8.ndim != 2:
-                mask_u8 = mask_u8[..., 0]
-            mask_bool = mask_u8 > 0
-        finally:
-            try:
-                if imp is not None:
-                    imp.changes = False
-                    imp.close()
-            except Exception:
-                pass
-            if tmp_path and os.path.exists(tmp_path):
-                try: os.remove(tmp_path)
-                except Exception: pass
-
-    except Exception as e:
-        used_ij = False
-        log.warning("ImageJ path failed; using scikit-image. Reason: %s", e)
-        mask_bool = build_mask_fiji_like(
-            img_rgb=img,
-            sigma_pre=sigma_pre,
-            dilate_iter=dilate_iter,
-            erode_iter=erode_iter,
-        )
+    # ---------- Build mask (scikit-image only) ----------
+    used_ij = False
+    mask_bool = build_mask_fiji_like(
+        img_rgb=img,
+        sigma_pre=sigma_pre,
+        dilate_iter=dilate_iter,
+        erode_iter=erode_iter,
+    )
 
     # -------- Filter regions (area, circularity, edge), then UNION --------
     labels = measure.label(mask_bool, connectivity=2)
@@ -282,7 +206,10 @@ async def analyze(
     px2 = px * px
 
     union_lab = measure.label(keep_mask, connectivity=2)
-    props = measure.regionprops(union_lab)[0]
+    props_list = measure.regionprops(union_lab)
+    if not props_list:
+        raise HTTPException(422, "Empty ROI after masking")
+    props = props_list[0]  # legacy behavior: take first connected ROI in the union
 
     area_px = float(props.area)
     perim_px = float(perimeter_crofton(keep_mask, directions=4))
@@ -316,14 +243,14 @@ async def analyze(
     circ = (4.0 * math.pi * area) / (perim * perim) if perim > 0 else 0.0
     hull_img = morphology.convex_hull_image(keep_mask)
     hull_area = float(hull_img.sum())
-    solidity = float(area_px / hull_area) if hull_area > 0 else 0.0  # note: solidity is unitless (use px ratio)
+    solidity = float(area_px / hull_area) if hull_area > 0 else 0.0  # unitless (px ratio)
 
     ar = float(major / minor) if minor > 0 else 0.0
     roundness = float((4.0 * area) / (math.pi * major * major)) if major > 0 else 0.0
 
     # ---- Intensity stats on inverted ImageJ gray (8-bit)
     gray_u8 = rgb_to_gray_ij_u8(img)
-    stat_img = 255 - gray_u8
+    stat_img = (255 - gray_u8).astype(np.uint8)
     vals = stat_img[keep_mask].astype(np.uint8)   # 0..255 integers
 
     if vals.size == 0:
