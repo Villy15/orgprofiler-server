@@ -33,6 +33,11 @@ api.add_middleware(
 def index():
     return {"message": "Hello World"}
 
+@api.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
