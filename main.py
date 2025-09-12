@@ -112,18 +112,18 @@ def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int
     # Morphology: dilate, fill, erode, fill
     se = square(3)
     for _ in range(int(dilate_iter)):
-        core = morphology.binary_dilation(core, selem=se)
+        core = morphology.binary_dilation(core, footprint=se)
     core = ndi.binary_fill_holes(core)
     for _ in range(int(erode_iter)):
-        core = morphology.binary_erosion(core, selem=se)
+        core = morphology.binary_erosion(core, footprint=se)
     core = ndi.binary_fill_holes(core)
 
     # Blur the mask-like core, then threshold "dark"
     soft = filters.gaussian(core.astype(float), sigma=sigma_pre, preserve_range=True)
-    # Normalize to 0..1 already; pick threshold on 0..255 scale like IJ then scale back
     t2 = filters.threshold_isodata((soft * 255).astype(np.uint8)) / 255.0
     final = soft <= t2
     return final
+
 
 # -----------------------------------------------------------------------------
 # Analyze
