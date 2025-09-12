@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import base64
 import io
-import logging
 import math
+import sys
 from typing import Any, Dict
 
 import numpy as np
@@ -17,37 +17,41 @@ from skimage import filters, measure, morphology, segmentation
 from skimage.morphology import footprint_rectangle, disk
 from skimage.measure import perimeter_crofton  # perimeter closer to ImageJ
 
-# -----------------------------------------------------------------------------
-# FastAPI
-# -----------------------------------------------------------------------------
+# ----------------------------
+# Logging (Loguru)
+# ----------------------------
+from loguru import logger
+
+# Configure Loguru: stderr sink with a helpful format
+logger.remove()
+logger.add(
+    sys.stderr,
+    level="INFO",
+    enqueue=True,
+    backtrace=True,
+    diagnose=True,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+           "<level>{level: <7}</level> | "
+           "{name}:{function}:{line} - <level>{message}</level>",
+)
+
+# ----------------------------
+# FastAPI setup
+# ----------------------------
 api = FastAPI()
 api.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
-
-@api.get("/")
-def index():
-    return {"message": "Hello World"}
 
 @api.get("/healthz")
 def healthz():
     return {"ok": True}
 
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-log = logging.getLogger("orgprofiler")
-if not log.handlers:
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-# -----------------------------------------------------------------------------
+# ----------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ----------------------------
 def to_data_url_png(arr: np.ndarray) -> str:
     a = arr
     if a.dtype != np.uint8:
@@ -101,10 +105,10 @@ def feret_features_from_points(points_xy: np.ndarray):
 
 def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int, erode_iter: int) -> np.ndarray:
     """
-    Scikit-image reproduction of the Fiji macro path:
+    Scikit-image reproduction of the Fiji macro path with memory tweaks:
       1) Threshold (Default) on 8-bit gray -> dark core
       2) Fill / Dilate^n / Fill / Erode^m / Fill
-      3) Gaussian Blur (sigma = sigma_pre)
+      3) Gaussian Blur (sigma = sigma_pre)  [float32 via SciPy]
       4) Auto-threshold again with 'Default dark' semantics
     """
     gray = rgb_to_gray_ij_u8(img_rgb)
@@ -115,7 +119,7 @@ def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int
     core = ndi.binary_fill_holes(core)
 
     # Morphology: dilate, fill, erode, fill
-    se = footprint_rectangle((3, 3)) 
+    se = footprint_rectangle((3, 3))
     for _ in range(int(dilate_iter)):
         core = morphology.binary_dilation(core, footprint=se)
     core = ndi.binary_fill_holes(core)
@@ -123,46 +127,45 @@ def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int
         core = morphology.binary_erosion(core, footprint=se)
     core = ndi.binary_fill_holes(core)
 
-    # Blur the mask-like core, then threshold "dark"
-    soft = filters.gaussian(core.astype(float), sigma=sigma_pre, preserve_range=True)
-    t2 = filters.threshold_isodata((soft * 255).astype(np.uint8)) / 255.0
-    final = soft <= t2
+    # ---- Memory-friendly Gaussian ----
+    core_f32 = core.astype(np.float32, copy=False)
+    soft_f32 = np.empty_like(core_f32, dtype=np.float32)
+    ndi.gaussian_filter(core_f32, sigma=sigma_pre, output=soft_f32, mode="nearest")
+
+    # Threshold again ("dark"): compute isodata on 0..255 uint8 equivalent
+    t2_u8 = filters.threshold_isodata((soft_f32 * 255).astype(np.uint8))
+    final = soft_f32 <= (t2_u8 / 255.0)
     return final
 
-
-# -----------------------------------------------------------------------------
-# Analyze
-# -----------------------------------------------------------------------------
-@api.post("/analyze")
-async def analyze(
-    file: UploadFile = File(...),
-
-    # Fiji-like knobs
-    sigma_pre: float = Query(6.4, ge=0.0),
-    dilate_iter: int = Query(4, ge=0),
-    erode_iter: int = Query(5, ge=0),
-    min_area_px: float = Query(60000, ge=0),    # area filter in pixels (macro logic)
-    max_area_px: float = Query(2.0e7, ge=0),
-    min_circ: float   = Query(0.28, ge=0.0, le=1.0),
-    edge_margin: float = Query(0.20, ge=0.0, le=0.49),
-    pixel_size_um: float = Query(0.86, gt=0.0),  # calibration to match Fiji output
-    overlay_width: int = Query(11, ge=1),        # visual only: match Fiji's line width ~11
+# ----------------------------
+# Core analysis (abstracted)
+# ----------------------------
+def analyze_image(
+    img: np.ndarray,
+    *,
+    sigma_pre: float,
+    dilate_iter: int,
+    erode_iter: int,
+    min_area_px: float,
+    max_area_px: float,
+    min_circ: float,
+    edge_margin: float,
+    pixel_size_um: float,
+    overlay_width: int,
+    return_images: bool,
 ) -> Dict[str, Any]:
-
-    data = await file.read()
-    try:
-        img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
-    except Exception:
-        raise HTTPException(400, "Invalid image")
+    """Pure function that performs the analysis and returns your legacy schema."""
+    H, W, _ = img.shape
+    logger.info(f"Analyze start | shape={H}x{W} sigma_pre={sigma_pre} "
+                f"dilate={dilate_iter} erode={erode_iter} px_um={pixel_size_um}")
 
     # Crop 2 px border like the macro
     if min(img.shape[:2]) > 8:
         img = img[2:-2, 2:-2, :]
+        H, W, _ = img.shape
+        logger.debug(f"Cropped border -> new shape={H}x{W}")
 
-    H, W, _ = img.shape
-
-    # ---------- Build mask (scikit-image only) ----------
-    used_ij = False
+    # ---------- Build mask ----------
     mask_bool = build_mask_fiji_like(
         img_rgb=img,
         sigma_pre=sigma_pre,
@@ -173,6 +176,7 @@ async def analyze(
     # -------- Filter regions (area, circularity, edge), then UNION --------
     labels = measure.label(mask_bool, connectivity=2)
     if labels.max() == 0:
+        logger.warning("No contours found after masking")
         raise HTTPException(422, "No contours found")
 
     xmin, xmax = W * edge_margin, W * (1.0 - edge_margin)
@@ -183,7 +187,6 @@ async def analyze(
         a_px = float(r.area)
         if a_px < min_area_px or a_px > max_area_px:
             continue
-        # perimeter in px for filtering circularity
         p_px = float(perimeter_crofton(labels == r.label, directions=4))
         circ_f = (4.0 * math.pi * a_px) / (p_px * p_px) if p_px > 0 else 0.0
         if circ_f < min_circ:
@@ -195,16 +198,8 @@ async def analyze(
 
     if not keep_mask.any():
         largest = max(measure.regionprops(labels), key=lambda rr: rr.area)
+        logger.info("Edge/circ filters removed all regions; falling back to largest region")
         keep_mask = labels == largest.label
-
-    # -------- Visual overlays (magenta, thickness like Fiji) --------
-    boundaries = segmentation.find_boundaries(keep_mask, mode="outer")
-    boundaries = morphology.binary_dilation(boundaries, disk(max(1, overlay_width // 2)))
-    overlay = img.copy()
-    overlay[boundaries] = np.array([255, 0, 255], dtype=np.uint8)
-
-    mask_vis = np.zeros_like(img, dtype=np.uint8)
-    mask_vis[keep_mask] = 255
 
     # -------- Measurements (convert to µm / µm²) --------
     px = float(pixel_size_um)
@@ -213,6 +208,7 @@ async def analyze(
     union_lab = measure.label(keep_mask, connectivity=2)
     props_list = measure.regionprops(union_lab)
     if not props_list:
+        logger.error("Empty ROI after masking")
         raise HTTPException(422, "Empty ROI after masking")
     props = props_list[0]  # legacy behavior: take first connected ROI in the union
 
@@ -227,9 +223,16 @@ async def analyze(
     minor_px = float(props.minor_axis_length or 0.0)
     angle = float(np.degrees(props.orientation or 0.0))
 
-    # Feret from union points (in px)
-    ys, xs = np.nonzero(keep_mask)
-    pts = np.column_stack((xs.astype(float), ys.astype(float)))
+    # Feret from boundary points (less memory than all foreground pixels)
+    contours = measure.find_contours(keep_mask, 0.5)
+    if contours:
+        cont = max(contours, key=lambda c: c.shape[0])
+        if cont.shape[0] > 4000:
+            cont = cont[::4]
+        pts = np.column_stack((cont[:, 1], cont[:, 0]))  # (x, y)
+    else:
+        pts = np.empty((0, 2))
+
     if pts.shape[0] >= 3:
         feret_px, minFeret_px, feretAngle, feretX_px, feretY_px = feret_features_from_points(pts)
     else:
@@ -246,10 +249,7 @@ async def analyze(
     feretX, feretY = feretX_px * px, feretY_px * px
 
     circ = (4.0 * math.pi * area) / (perim * perim) if perim > 0 else 0.0
-    hull_img = morphology.convex_hull_image(keep_mask)
-    hull_area = float(hull_img.sum())
-    solidity = float(area_px / hull_area) if hull_area > 0 else 0.0  # unitless (px ratio)
-
+    solidity = float(props.solidity) if hasattr(props, "solidity") else 0.0
     ar = float(major / minor) if minor > 0 else 0.0
     roundness = float((4.0 * area) / (math.pi * major * major)) if major > 0 else 0.0
 
@@ -257,8 +257,8 @@ async def analyze(
     gray_u8 = rgb_to_gray_ij_u8(img)
     stat_img = (255 - gray_u8).astype(np.uint8)
     vals = stat_img[keep_mask].astype(np.uint8)   # 0..255 integers
-
     if vals.size == 0:
+        logger.error("Empty ROI after masking (no intensity values)")
         raise HTTPException(422, "Empty ROI after masking")
 
     mean   = float(vals.mean())
@@ -274,7 +274,6 @@ async def analyze(
     else:
         skew = kurt = 0.0
 
-    # ImageJ “IntDen” is sum of pixel values in ROI on the inverted gray
     rawIntDen = float(vals.sum())
     intDen    = rawIntDen  # equals area_px * mean on 8-bit inverted gray
 
@@ -282,19 +281,75 @@ async def analyze(
     ym_px, xm_px = ndi.center_of_mass(stat_img, labels=keep_mask.astype(np.uint8), index=1)
     xm, ym = float(xm_px * px), float(ym_px * px)
 
-    # ---------- LEGACY SCHEMA (exact keys) ----------
+    # ---------- Visual overlays (cropped; build only if requested) ----------
+    if return_images:
+        local_mask = keep_mask[minr:maxr, minc:maxc]
+        overlay = img[minr:maxr, minc:maxc].copy()
+        boundaries = segmentation.find_boundaries(local_mask, mode="outer")
+        boundaries = morphology.binary_dilation(boundaries, disk(max(1, overlay_width // 2)))
+        overlay[boundaries] = np.array([255, 0, 255], dtype=np.uint8)
+        mask_vis = (local_mask.astype(np.uint8) * 255)
+        roi_image_b64 = to_data_url_png(overlay)
+        mask_image_b64 = to_data_url_png(mask_vis)
+    else:
+        roi_image_b64 = ""
+        mask_image_b64 = ""
+
     results = {
         "area": area, "mean": mean, "stdDev": stdDev, "mode": mode, "min": vmin, "max": vmax,
         "x": cx, "y": cy, "xm": xm, "ym": ym, "perim": perim, "bx": bx, "by": by,
         "width": width, "height": height, "major": major, "minor": minor, "angle": angle,
-        "circ": circ, "feret": feret, "intDen": intDen, "median": median, "skew": -skew,  # macro outputs -Skew
+        "circ": circ, "feret": feret, "intDen": intDen, "median": median, "skew": -skew,
         "kurt": kurt, "rawIntDen": rawIntDen, "feretX": feretX, "feretY": feretY,
         "feretAngle": feretAngle, "minFeret": minFeret, "ar": ar, "round": roundness,
-        "solidity": solidity, "usedImageJ": used_ij,
+        "solidity": solidity,
     }
 
+    logger.info(f"Analyze done | area_px={area_px:.0f} perim_px={perim_px:.1f} circ={circ:.3f}")
     return {
         "results": results,
-        "roi_image": to_data_url_png(overlay),
-        "mask_image": to_data_url_png(mask_vis),
+        "roi_image": roi_image_b64,
+        "mask_image": mask_image_b64,
     }
+
+# ----------------------------
+# API route (thin wrapper)
+# ----------------------------
+@api.post("/analyze")
+async def analyze(
+    file: UploadFile = File(...),
+
+    # Fiji-like knobs
+    sigma_pre: float = Query(6.4, ge=0.0),
+    dilate_iter: int = Query(4, ge=0),
+    erode_iter: int = Query(5, ge=0),
+    min_area_px: float = Query(60000, ge=0),
+    max_area_px: float = Query(2.0e7, ge=0),
+    min_circ: float   = Query(0.28, ge=0.0, le=1.0),
+    edge_margin: float = Query(0.20, ge=0.0, le=0.49),
+    pixel_size_um: float = Query(0.86, gt=0.0),
+    overlay_width: int = Query(11, ge=1),
+    return_images: bool = Query(True),
+) -> Dict[str, Any]:
+    data = await file.read()
+    logger.info(f"Received file: filename={file.filename!r} size={len(data)} bytes")
+
+    try:
+        img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+    except Exception:
+        logger.exception("Invalid image payload")
+        raise HTTPException(400, "Invalid image")
+
+    return analyze_image(
+        img,
+        sigma_pre=sigma_pre,
+        dilate_iter=dilate_iter,
+        erode_iter=erode_iter,
+        min_area_px=min_area_px,
+        max_area_px=max_area_px,
+        min_circ=min_circ,
+        edge_margin=edge_margin,
+        pixel_size_um=pixel_size_um,
+        overlay_width=overlay_width,
+        return_images=return_images,
+    )
