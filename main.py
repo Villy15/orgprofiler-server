@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from scipy import ndimage as ndi
 from scipy.spatial import ConvexHull
 from skimage import filters, measure, morphology, segmentation
-from skimage.morphology import square, disk
+from skimage.morphology import footprint_rectangle, disk
 from skimage.measure import perimeter_crofton  # perimeter closer to ImageJ
 
 # -----------------------------------------------------------------------------
@@ -110,7 +110,7 @@ def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int
     core = ndi.binary_fill_holes(core)
 
     # Morphology: dilate, fill, erode, fill
-    se = square(3)
+    se = footprint_rectangle((3, 3)) 
     for _ in range(int(dilate_iter)):
         core = morphology.binary_dilation(core, footprint=se)
     core = ndi.binary_fill_holes(core)
