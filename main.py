@@ -17,6 +17,87 @@ from skimage import filters, measure, morphology, segmentation
 from skimage.morphology import footprint_rectangle, disk
 from skimage.measure import perimeter_crofton  # perimeter closer to ImageJ
 
+# --- add near the top ---
+import os, time, platform
+try:
+    import psutil  # process CPU/memory
+except Exception as e:
+    psutil = None
+    logger.warning("psutil not installed; resource profiling disabled")
+
+def _ru_maxrss_bytes() -> int | None:
+    """Best-effort peak RSS (bytes). Linux returns KB; macOS returns bytes."""
+    try:
+        import resource, sys  # resource is POSIX-only
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform.startswith("linux"):
+            return int(r) * 1024
+        # macOS returns bytes
+        return int(r)
+    except Exception:
+        return None
+
+class ResourceProfiler:
+    """Context manager to measure wall time, CPU time, RSS delta, and peak RSS."""
+    def __init__(self, label: str = "analyze"):
+        self.label = label
+        self.metrics: Dict[str, float] = {}
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        if psutil:
+            self.proc = psutil.Process(os.getpid())
+            self.ct0 = self.proc.cpu_times()
+            self.mem0 = self.proc.memory_info().rss
+        else:
+            self.proc = None
+            self.ct0 = None
+            self.mem0 = None
+        self.maxrss0 = _ru_maxrss_bytes()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        t1 = time.perf_counter()
+        wall_s = t1 - self.t0
+
+        cpu_user_s = cpu_sys_s = rss_now = rss_delta = None
+        if self.proc:
+            ct1 = self.proc.cpu_times()
+            mi1 = self.proc.memory_info()
+            cpu_user_s = (ct1.user - self.ct0.user)
+            cpu_sys_s  = (ct1.system - self.ct0.system)
+            rss_now    = mi1.rss
+            rss_delta  = (rss_now - self.mem0)
+
+        maxrss1 = _ru_maxrss_bytes()
+        peak_rss_bytes = None
+        if maxrss1 is not None and self.maxrss0 is not None:
+            peak_rss_bytes = max(0, maxrss1 - self.maxrss0) or maxrss1  # show peak if delta 0
+
+        # Keep numbers both in bytes and MB for readability
+        def mb(x): return None if x is None else round(x / (1024*1024), 3)
+
+        self.metrics = {
+            "wall_time_s": round(wall_s, 6),
+            "cpu_user_s": None if cpu_user_s is None else round(cpu_user_s, 6),
+            "cpu_sys_s": None if cpu_sys_s is None else round(cpu_sys_s, 6),
+            "rss_now_bytes": rss_now,
+            "rss_now_mb": mb(rss_now),
+            "rss_delta_bytes": rss_delta,
+            "rss_delta_mb": mb(rss_delta),
+            "peak_rss_bytes": peak_rss_bytes,
+            "peak_rss_mb": mb(peak_rss_bytes),
+            "platform": platform.platform(),
+        }
+
+        logger.info(
+            f"[{self.label}] wall={wall_s:.3f}s "
+            f"cpu_user={self.metrics['cpu_user_s']}s cpu_sys={self.metrics['cpu_sys_s']}s "
+            f"rss_now={self.metrics['rss_now_mb']}MB Δrss={self.metrics['rss_delta_mb']}MB "
+            f"peak_rss={self.metrics['peak_rss_mb']}MB"
+        )
+
+
 # ----------------------------
 # Logging (Loguru)
 # ----------------------------
@@ -318,7 +399,6 @@ def analyze_image(
 @api.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
-
     # Fiji-like knobs
     sigma_pre: float = Query(6.4, ge=0.0),
     dilate_iter: int = Query(4, ge=0),
@@ -330,6 +410,7 @@ async def analyze(
     pixel_size_um: float = Query(0.86, gt=0.0),
     overlay_width: int = Query(11, ge=1),
     return_images: bool = Query(True),
+    profile: bool = Query(False),  # <— add this
 ) -> Dict[str, Any]:
     data = await file.read()
     logger.info(f"Received file: filename={file.filename!r} size={len(data)} bytes")
@@ -340,16 +421,23 @@ async def analyze(
         logger.exception("Invalid image payload")
         raise HTTPException(400, "Invalid image")
 
-    return analyze_image(
-        img,
-        sigma_pre=sigma_pre,
-        dilate_iter=dilate_iter,
-        erode_iter=erode_iter,
-        min_area_px=min_area_px,
-        max_area_px=max_area_px,
-        min_circ=min_circ,
-        edge_margin=edge_margin,
-        pixel_size_um=pixel_size_um,
-        overlay_width=overlay_width,
-        return_images=return_images,
-    )
+    with ResourceProfiler("analyze") as prof:
+        payload = analyze_image(
+            img,
+            sigma_pre=sigma_pre,
+            dilate_iter=dilate_iter,
+            erode_iter=erode_iter,
+            min_area_px=min_area_px,
+            max_area_px=max_area_px,
+            min_circ=min_circ,
+            edge_margin=edge_margin,
+            pixel_size_um=pixel_size_um,
+            overlay_width=overlay_width,
+            return_images=return_images,
+        )
+
+    if profile and prof.metrics:
+        # include metrics only when asked
+        payload["profile"] = prof.metrics
+
+    return payload
