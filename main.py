@@ -215,7 +215,9 @@ def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int
 
     # Threshold again ("dark"): compute isodata on 0..255 uint8 equivalent
     t2_u8 = filters.threshold_isodata((soft_f32 * 255).astype(np.uint8))
-    final = soft_f32 <= (t2_u8 / 255.0)
+    thr = t2_u8 / 255.0
+    final = soft_f32 >= thr  # keep the blurred core (object), not the background
+    
     return final
 
 # ----------------------------
@@ -364,12 +366,13 @@ def analyze_image(
 
     # ---------- Visual overlays (cropped; build only if requested) ----------
     if return_images:
-        local_mask = keep_mask[minr:maxr, minc:maxc]
-        overlay = img[minr:maxr, minc:maxc].copy()
-        boundaries = segmentation.find_boundaries(local_mask, mode="outer")
+        overlay = img.copy()  # full frame
+        boundaries = segmentation.find_boundaries(keep_mask, mode="outer")
         boundaries = morphology.binary_dilation(boundaries, disk(max(1, overlay_width // 2)))
         overlay[boundaries] = np.array([255, 0, 255], dtype=np.uint8)
-        mask_vis = (local_mask.astype(np.uint8) * 255)
+
+        mask_vis = (keep_mask.astype(np.uint8) * 255)  # full-frame mask
+
         roi_image_b64 = to_data_url_png(overlay)
         mask_image_b64 = to_data_url_png(mask_vis)
     else:
