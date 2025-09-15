@@ -1,34 +1,56 @@
-# main.py
 from __future__ import annotations
+import json
+from typing import Tuple
 
 import base64
 import io
 import math
+import re
 import sys
 from typing import Any, Dict
 
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from scipy import ndimage as ndi
 from scipy.spatial import ConvexHull
 from skimage import filters, measure, morphology, segmentation
 from skimage.morphology import footprint_rectangle, disk
-from skimage.measure import perimeter_crofton  # perimeter closer to ImageJ
+from skimage.measure import perimeter_crofton
+from skimage.segmentation import clear_border
 
-# --- add near the top ---
+# ----------------------------
+# Logging (Loguru)
+# ----------------------------
+from loguru import logger
+
+logger.remove()
+logger.add(
+    sys.stderr,
+    level="INFO",
+    enqueue=True,
+    backtrace=True,
+    diagnose=True,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+           "<level>{level: <7}</level> | "
+           "{name}:{function}:{line} - <level>{message}</level>",
+)
+
+# ----------------------------
+# psutil + peak RSS helpers
+# ----------------------------
 import os, time, platform
 try:
     import psutil  # process CPU/memory
-except Exception as e:
+except Exception:
     psutil = None
     logger.warning("psutil not installed; resource profiling disabled")
 
 def _ru_maxrss_bytes() -> int | None:
     """Best-effort peak RSS (bytes). Linux returns KB; macOS returns bytes."""
     try:
-        import resource, sys  # resource is POSIX-only
+        import resource
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         if sys.platform.startswith("linux"):
             return int(r) * 1024
@@ -74,7 +96,6 @@ class ResourceProfiler:
         if maxrss1 is not None and self.maxrss0 is not None:
             peak_rss_bytes = max(0, maxrss1 - self.maxrss0) or maxrss1  # show peak if delta 0
 
-        # Keep numbers both in bytes and MB for readability
         def mb(x): return None if x is None else round(x / (1024*1024), 3)
 
         self.metrics = {
@@ -96,25 +117,6 @@ class ResourceProfiler:
             f"rss_now={self.metrics['rss_now_mb']}MB Δrss={self.metrics['rss_delta_mb']}MB "
             f"peak_rss={self.metrics['peak_rss_mb']}MB"
         )
-
-
-# ----------------------------
-# Logging (Loguru)
-# ----------------------------
-from loguru import logger
-
-# Configure Loguru: stderr sink with a helpful format
-logger.remove()
-logger.add(
-    sys.stderr,
-    level="INFO",
-    enqueue=True,
-    backtrace=True,
-    diagnose=True,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-           "<level>{level: <7}</level> | "
-           "{name}:{function}:{line} - <level>{message}</level>",
-)
 
 # ----------------------------
 # FastAPI setup
@@ -184,13 +186,34 @@ def feret_features_from_points(points_xy: np.ndarray):
 
     return float(feret_max), float(min_width), float(feret_angle), feretX, feretY
 
-def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int, erode_iter: int) -> np.ndarray:
+def ring_background_mean(u8_img: np.ndarray, mask: np.ndarray, ring_px: int = 20, method: str = "median") -> float:
+    """Mean/median intensity in a ring outside mask (background) on an 8-bit image."""
+    r = max(1, int(ring_px))
+    ring = morphology.binary_dilation(mask, footprint=disk(r)) & ~mask
+    vals = u8_img[ring]
+    if vals.size == 0:  # fallback if ring empty (tiny ROI, near edge)
+        vals = u8_img[~mask]
+    if vals.size == 0:
+        return 0.0
+    return float(np.median(vals) if method == "median" else np.mean(vals))
+
+# ----------------------------
+# Mask builder (Fiji-like path)
+# ----------------------------
+def build_mask_fiji_like(
+    img_rgb: np.ndarray,
+    *,
+    sigma_pre: float,
+    dilate_iter: int,
+    erode_iter: int,
+    clear_border_artifacts: bool = True,
+) -> np.ndarray:
     """
-    Scikit-image reproduction of the Fiji macro path with memory tweaks:
-      1) Threshold (Default) on 8-bit gray -> dark core
+    Reproduce the Fiji macro path with memory-friendly ops.
+      1) Threshold (isodata) on 8-bit gray -> dark core
       2) Fill / Dilate^n / Fill / Erode^m / Fill
-      3) Gaussian Blur (sigma = sigma_pre)  [float32 via SciPy]
-      4) Auto-threshold again with 'Default dark' semantics
+      3) Gaussian Blur (sigma = sigma_pre) on float32
+      4) Auto-threshold again (keep object)
     """
     gray = rgb_to_gray_ij_u8(img_rgb)
 
@@ -208,20 +231,43 @@ def build_mask_fiji_like(img_rgb: np.ndarray, sigma_pre: float, dilate_iter: int
         core = morphology.binary_erosion(core, footprint=se)
     core = ndi.binary_fill_holes(core)
 
-    # ---- Memory-friendly Gaussian ----
+    # Gaussian on float32
     core_f32 = core.astype(np.float32, copy=False)
     soft_f32 = np.empty_like(core_f32, dtype=np.float32)
     ndi.gaussian_filter(core_f32, sigma=sigma_pre, output=soft_f32, mode="nearest")
 
-    # Threshold again ("dark"): compute isodata on 0..255 uint8 equivalent
+    # Second threshold: keep object (>=), not background
     t2_u8 = filters.threshold_isodata((soft_f32 * 255).astype(np.uint8))
     thr = t2_u8 / 255.0
-    final = soft_f32 >= thr  # keep the blurred core (object), not the background
-    
+    final = soft_f32 >= thr
+
+    if clear_border_artifacts:
+        final = clear_border(final)
+
+    # Safety: if >80% of frame is foreground, flip (rare inversion cases)
+    if final.mean() > 0.8:
+        final = ~final
+
     return final
 
+# helper to parse day/organoid from filename
+FILENAME_RE = re.compile(r"_d(?P<day>\d{2})_(?P<organoid>\d{1,3})(?=\.)")
+
+def parse_day_organoid(fname: str) -> Tuple[str | None, str | None]:
+    """
+    Extract day ('00') and organoid number ('008') from filenames like:
+      YYYY-MM-DD_d00_08.jpg
+    Returns zero-padded strings or (None, None) if not matched.
+    """
+    m = FILENAME_RE.search(fname or "")
+    if not m:
+        return None, None
+    day = m.group("day")
+    organoid = m.group("organoid").zfill(3)  # Fiji-style 3-digit
+    return day, organoid
+
 # ----------------------------
-# Core analysis (abstracted)
+# Core analysis
 # ----------------------------
 def analyze_image(
     img: np.ndarray,
@@ -236,19 +282,20 @@ def analyze_image(
     pixel_size_um: float,
     overlay_width: int,
     return_images: bool,
+    crop_overlay: bool,
+    crop_border_px: int,
+    ring_px: int,
 ) -> Dict[str, Any]:
-    """Pure function that performs the analysis and returns your legacy schema."""
     H, W, _ = img.shape
-    logger.info(f"Analyze start | shape={H}x{W} sigma_pre={sigma_pre} "
-                f"dilate={dilate_iter} erode={erode_iter} px_um={pixel_size_um}")
+    logger.info(f"Analyze start | shape={H}x{W} sigma={sigma_pre} dilate={dilate_iter} erode={erode_iter} px_um={pixel_size_um}")
 
-    # Crop 2 px border like the macro
-    if min(img.shape[:2]) > 8:
-        img = img[2:-2, 2:-2, :]
+    # Optional border crop
+    if crop_border_px > 0 and min(img.shape[:2]) > 2 * crop_border_px:
+        img = img[crop_border_px:-crop_border_px, crop_border_px:-crop_border_px, :]
         H, W, _ = img.shape
-        logger.debug(f"Cropped border -> new shape={H}x{W}")
+        logger.debug(f"Cropped border -> {H}x{W}")
 
-    # ---------- Build mask ----------
+    # Build mask
     mask_bool = build_mask_fiji_like(
         img_rgb=img,
         sigma_pre=sigma_pre,
@@ -256,7 +303,6 @@ def analyze_image(
         erode_iter=erode_iter,
     )
 
-    # -------- Filter regions (area, circularity, edge), then UNION --------
     labels = measure.label(mask_bool, connectivity=2)
     if labels.max() == 0:
         logger.warning("No contours found after masking")
@@ -281,32 +327,27 @@ def analyze_image(
 
     if not keep_mask.any():
         largest = max(measure.regionprops(labels), key=lambda rr: rr.area)
-        logger.info("Edge/circ filters removed all regions; falling back to largest region")
+        logger.info("Filters removed all; falling back to largest region")
         keep_mask = labels == largest.label
 
-    # -------- Measurements (convert to µm / µm²) --------
-    px = float(pixel_size_um)
-    px2 = px * px
-
+    # Measurements in px
     union_lab = measure.label(keep_mask, connectivity=2)
     props_list = measure.regionprops(union_lab)
     if not props_list:
         logger.error("Empty ROI after masking")
         raise HTTPException(422, "Empty ROI after masking")
-    props = props_list[0]  # legacy behavior: take first connected ROI in the union
+    props = props_list[0]
 
     area_px = float(props.area)
     perim_px = float(perimeter_crofton(keep_mask, directions=4))
     minr, minc, maxr, maxc = props.bbox
-    bx_px, by_px = float(minc), float(minr)
-    width_px, height_px = float(maxc - minc), float(maxr - minr)
 
     cy_px, cx_px = props.centroid
     major_px = float(props.major_axis_length or 0.0)
     minor_px = float(props.minor_axis_length or 0.0)
     angle = float(np.degrees(props.orientation or 0.0))
 
-    # Feret from boundary points (less memory than all foreground pixels)
+    # Feret from boundary points
     contours = measure.find_contours(keep_mask, 0.5)
     if contours:
         cont = max(contours, key=lambda c: c.shape[0])
@@ -322,27 +363,29 @@ def analyze_image(
         feret_px = minFeret_px = feretAngle = feretX_px = feretY_px = 0.0
 
     # Convert to µm / µm²
-    area = area_px * px2
-    perim = perim_px * px
-    bx, by = bx_px * px, by_px * px
-    width, height = width_px * px, height_px * px
-    cx, cy = cx_px * px, cy_px * px
-    major, minor = major_px * px, minor_px * px
-    feret, minFeret = feret_px * px, minFeret_px * px
-    feretX, feretY = feretX_px * px, feretY_px * px
+    px_um = float(pixel_size_um)
+    area = area_px * (px_um ** 2)
+    perim = perim_px * px_um
+    cx, cy = cx_px * px_um, cy_px * px_um
+    major, minor = major_px * px_um, minor_px * px_um
+    feret, minFeret = feret_px * px_um, minFeret_px * px_um
+    feretX, feretY = feretX_px * px_um, feretY_px * px_um
+    bx_px, by_px = float(props.bbox[1]), float(props.bbox[0])
+    width_px, height_px = float(props.bbox[3] - props.bbox[1]), float(props.bbox[2] - props.bbox[0])
+    bx, by = bx_px * px_um, by_px * px_um
+    width, height = width_px * px_um, height_px * px_um
 
     circ = (4.0 * math.pi * area) / (perim * perim) if perim > 0 else 0.0
     solidity = float(props.solidity) if hasattr(props, "solidity") else 0.0
     ar = float(major / minor) if minor > 0 else 0.0
     roundness = float((4.0 * area) / (math.pi * major * major)) if major > 0 else 0.0
 
-    # ---- Intensity stats on inverted ImageJ gray (8-bit)
+    # Intensity stats on inverted ImageJ gray (8-bit)
     gray_u8 = rgb_to_gray_ij_u8(img)
     stat_img = (255 - gray_u8).astype(np.uint8)
-    vals = stat_img[keep_mask].astype(np.uint8)   # 0..255 integers
+    vals = stat_img[keep_mask].astype(np.uint8)
     if vals.size == 0:
-        logger.error("Empty ROI after masking (no intensity values)")
-        raise HTTPException(422, "Empty ROI after masking")
+        raise HTTPException(422, "Empty ROI after masking (no intensity values)")
 
     mean   = float(vals.mean())
     median = float(np.median(vals))
@@ -357,39 +400,63 @@ def analyze_image(
     else:
         skew = kurt = 0.0
 
-    rawIntDen = float(vals.sum())
-    intDen    = rawIntDen  # equals area_px * mean on 8-bit inverted gray
+    rawIntDen = float(vals.sum())  # Integrated intensity
+    intDen    = rawIntDen
 
     # Intensity-weighted centroid (XM, YM) on inverted gray (in µm)
     ym_px, xm_px = ndi.center_of_mass(stat_img, labels=keep_mask.astype(np.uint8), index=1)
-    xm, ym = float(xm_px * px), float(ym_px * px)
+    xm, ym = float(xm_px * px_um), float(ym_px * px_um)
 
-    # ---------- Visual overlays (cropped; build only if requested) ----------
+    # Background ring + corrected metrics
+    bg = ring_background_mean(stat_img, keep_mask, ring_px=ring_px, method="median")
+    corrected_total_intensity = rawIntDen - bg * area_px
+    corrected_mean_intensity  = mean - bg
+    corrected_min_intensity   = vmin - bg
+    corrected_max_intensity   = vmax - bg
+
+    # Extra derived metrics
+    eq_diam = math.sqrt(4.0 * area / math.pi)
+    centroid_to_com = math.hypot(float(xm - cx), float(ym - cy))
+
+    # ---------- Visual overlays ----------
     if return_images:
-        overlay = img.copy()  # full frame
-        boundaries = segmentation.find_boundaries(keep_mask, mode="outer")
+        if crop_overlay:
+            local_mask = keep_mask[minr:maxr, minc:maxc]
+            overlay = img[minr:maxr, minc:maxc].copy()
+            boundaries = segmentation.find_boundaries(local_mask, mode="outer")
+        else:
+            local_mask = keep_mask
+            overlay = img.copy()
+            boundaries = segmentation.find_boundaries(keep_mask, mode="outer")
         boundaries = morphology.binary_dilation(boundaries, disk(max(1, overlay_width // 2)))
         overlay[boundaries] = np.array([255, 0, 255], dtype=np.uint8)
-
-        mask_vis = (keep_mask.astype(np.uint8) * 255)  # full-frame mask
-
+        mask_vis = (local_mask.astype(np.uint8) * 255)
         roi_image_b64 = to_data_url_png(overlay)
         mask_image_b64 = to_data_url_png(mask_vis)
     else:
         roi_image_b64 = ""
         mask_image_b64 = ""
 
+    # Unified results mapping (frontend can format Fiji headers)
     results = {
         "area": area, "mean": mean, "stdDev": stdDev, "mode": mode, "min": vmin, "max": vmax,
         "x": cx, "y": cy, "xm": xm, "ym": ym, "perim": perim, "bx": bx, "by": by,
         "width": width, "height": height, "major": major, "minor": minor, "angle": angle,
-        "circ": circ, "feret": feret, "intDen": intDen, "median": median, "skew": -skew,
+        "circ": circ, "feret": feret, "intDen": intDen, "median": median, "skew": -skew,  # keep your legacy sign
         "kurt": kurt, "rawIntDen": rawIntDen, "feretX": feretX, "feretY": feretY,
         "feretAngle": feretAngle, "minFeret": minFeret, "ar": ar, "round": roundness,
         "solidity": solidity,
+        # --- Added fields for Fiji-style export ---
+        "eqDiam": eq_diam,
+        "corrTotalInt": corrected_total_intensity,
+        "corrMeanInt": corrected_mean_intensity,
+        "corrMinInt": corrected_min_intensity,
+        "corrMaxInt": corrected_max_intensity,
+        "centroidToCom": centroid_to_com,
+        "bgRing": bg,
     }
 
-    logger.info(f"Analyze done | area_px={area_px:.0f} perim_px={perim_px:.1f} circ={circ:.3f}")
+    logger.info(f"Analyze done | area_px={area_px:.0f} perim_px={perim_px:.1f} circ={circ:.3f} eq_diam={eq_diam:.2f}µm")
     return {
         "results": results,
         "roi_image": roi_image_b64,
@@ -413,10 +480,23 @@ async def analyze(
     pixel_size_um: float = Query(0.86, gt=0.0),
     overlay_width: int = Query(11, ge=1),
     return_images: bool = Query(True),
-    profile: bool = Query(False),  # <— add this
+    crop_overlay: bool = Query(False, description="Return cropped overlay (bbox) instead of full frame"),
+    crop_border_px: int = Query(2, ge=0, description="Border pixels to crop before analysis"),
+    ring_px: int = Query(20, ge=1, description="Background ring thickness in pixels"),
+    profile: bool = Query(False),  # include ResourceProfiler metrics in response
+     # --- NEW: baselines for Fiji-style growth rate ---
+    day0_area: float | None = Form(None, description="Baseline area for THIS organoid at day 0 (µm²)"),
+    mean_day0_area: float | None = Form(None, description="Mean area across all organoids at day 0 (µm²)"),
+    day0_area_by_organoid: str | None = Form(
+        None,
+        description='JSON dict like {"001": 344197.27, "008": 300000.0} (areas in µm²)'
+    ),
 ) -> Dict[str, Any]:
     data = await file.read()
+    filename = file.filename or ""
     logger.info(f"Received file: filename={file.filename!r} size={len(data)} bytes")
+
+    day, organoid_number = parse_day_organoid(filename)
 
     try:
         img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
@@ -437,10 +517,49 @@ async def analyze(
             pixel_size_um=pixel_size_um,
             overlay_width=overlay_width,
             return_images=return_images,
+            crop_overlay=crop_overlay,
+            crop_border_px=crop_border_px,
+            ring_px=ring_px,
         )
+    
+    # ---------- Compute Fiji-style growthRate ----------
+    area_value = float(payload["results"]["area"])  # area in µm² (already scaled)
+    growth_rate = None
+
+    if day == "00":
+        growth_rate = 1.0
+    else:
+        baseline = None
+
+        # 1) try per-organoid mapping if provided
+        if day0_area_by_organoid:
+            try:
+                mapping = json.loads(day0_area_by_organoid)
+                if isinstance(mapping, dict) and organoid_number:
+                    maybe = mapping.get(organoid_number)
+                    if isinstance(maybe, (int, float)):
+                        baseline = float(maybe)
+            except Exception:
+                logger.warning("Invalid JSON for day0_area_by_organoid; ignoring")
+
+        # 2) explicit baseline for this organoid (single value)
+        if baseline is None and day0_area is not None:
+            baseline = float(day0_area)
+
+        # 3) fallback to mean day-0 area
+        if baseline is None and mean_day0_area is not None:
+            baseline = float(mean_day0_area)
+
+        if baseline and baseline > 0:
+            growth_rate = area_value / baseline
+
+
+    payload["results"]["day"] = day
+    payload["results"]["organoidNumber"] = organoid_number
+    payload["results"]["growthRate"] = growth_rate  # <-- NEW
+
 
     if profile and prof.metrics:
-        # include metrics only when asked
         payload["profile"] = prof.metrics
 
     return payload
