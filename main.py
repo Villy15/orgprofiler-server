@@ -1,6 +1,7 @@
+# main.py
 from __future__ import annotations
 import json
-from typing import Tuple
+from typing import Tuple, Optional, Literal
 import contextlib
 from functools import lru_cache
 
@@ -22,10 +23,12 @@ from skimage.morphology import footprint_rectangle, disk
 from skimage.measure import perimeter_crofton
 from skimage.segmentation import clear_border
 
+# ----------------------------
+# Small utils
+# ----------------------------
 
 @lru_cache(maxsize=64)
 def _disk_bool(r: int) -> np.ndarray:
-    # Cached for the optional 'dilate' path
     return disk(int(r)).astype(bool, copy=False)
 
 # ----------------------------
@@ -50,26 +53,20 @@ logger.add(
 # ----------------------------
 import os, time, platform
 try:
-    import psutil  # process CPU/memory
+    import psutil
 except Exception:
     psutil = None
     logger.warning("psutil not installed; resource profiling disabled")
 
 def _ru_maxrss_bytes() -> int | None:
-    """Best-effort peak RSS (bytes). Linux returns KB; macOS returns bytes."""
     try:
         import resource
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         if sys.platform.startswith("linux"):
             return int(r) * 1024
-        # macOS returns bytes
         return int(r)
     except Exception:
         return None
-
-# ----------------------------
-# Tiny timing helpers
-# ----------------------------
 
 @contextlib.contextmanager
 def time_block(label: str):
@@ -80,9 +77,7 @@ def time_block(label: str):
         dt = time.perf_counter() - _t0
         logger.info(f"[TIMER] {label}: {dt:.3f}s")
 
-
 class ResourceProfiler:
-    """Context manager to measure wall time, CPU time, RSS delta, and peak RSS."""
     def __init__(self, label: str = "analyze"):
         self.label = label
         self.metrics: Dict[str, float] = {}
@@ -116,7 +111,7 @@ class ResourceProfiler:
         maxrss1 = _ru_maxrss_bytes()
         peak_rss_bytes = None
         if maxrss1 is not None and self.maxrss0 is not None:
-            peak_rss_bytes = max(0, maxrss1 - self.maxrss0) or maxrss1  # show peak if delta 0
+            peak_rss_bytes = max(0, maxrss1 - self.maxrss0) or maxrss1
 
         def mb(x): return None if x is None else round(x / (1024*1024), 3)
 
@@ -167,7 +162,6 @@ def to_data_url_png(arr: np.ndarray) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 def rgb_to_gray_ij_u8(img_rgb: np.ndarray) -> np.ndarray:
-    """ImageJ's 8-bit gray: 0.299R + 0.587G + 0.114B (no gamma)."""
     r = img_rgb[..., 0].astype(np.float32)
     g = img_rgb[..., 1].astype(np.float32)
     b = img_rgb[..., 2].astype(np.float32)
@@ -175,7 +169,6 @@ def rgb_to_gray_ij_u8(img_rgb: np.ndarray) -> np.ndarray:
     return np.clip(gray, 0, 255).astype(np.uint8)
 
 def feret_features_from_points(points_xy: np.ndarray):
-    """Return Feret max, min, angle (deg), start X, start Y from hull points (x,y) in *pixels*."""
     if points_xy.shape[0] < 2:
         return 0.0, 0.0, 0.0, 0.0, 0.0
     hull = ConvexHull(points_xy)
@@ -214,20 +207,14 @@ def ring_background_mean(
     ring_px: int = 20,
     method: str = "median",
     *,
-    bbox: tuple[int, int, int, int] | None = None,  # (minr, minc, maxr, maxc) in mask coords
+    bbox: tuple[int, int, int, int] | None = None,
     pad: int = 2,
-    algo: str = "edt",        # "edt" (fast) or "dilate" (compatible)
+    algo: str = "edt",
     max_samples: int = 250_000,
 ) -> float:
-    """
-    Fast mean/median intensity in a ring just *outside* the mask.
-    - Restricts computation to a padded bbox around the organoid.
-    - Default 'edt' path avoids slow large-kernel dilation.
-    """
     r = max(1, int(ring_px))
     h, w = u8_img.shape[:2]
 
-    # Determine bbox (use provided or compute from mask)
     if bbox is None:
         ys, xs = np.nonzero(mask)
         if ys.size == 0:
@@ -237,16 +224,13 @@ def ring_background_mean(
     else:
         minr, minc, maxr, maxc = map(int, bbox)
 
-    # Pad bbox by ring thickness, clamp to image
     minr = max(0, minr - r - pad); maxr = min(h, maxr + r + pad)
     minc = max(0, minc - r - pad); maxc = min(w, maxc + r + pad)
 
     roi_mask = mask[minr:maxr, minc:maxc].astype(bool, copy=False)
     roi_img  = u8_img[minr:maxr, minc:maxc]
 
-    # Build ring
     if algo == "edt":
-        # Distance on 'outside' to nearest mask pixel; ring = (0, r]
         outside = ~roi_mask
         if not outside.any():
             outside = ~mask
@@ -254,22 +238,21 @@ def ring_background_mean(
         dist = ndi.distance_transform_edt(outside)
         ring = (dist > 0) & (dist <= r)
     else:
-        # Optional: faster than skimage on many setups, still bbox-restricted
         dil = ndi.binary_dilation(roi_mask, structure=_disk_bool(r), iterations=1)
         ring = dil & ~roi_mask
 
     vals = roi_img[ring]
-    if vals.size == 0:       # fallback if ring empty (tiny ROI, edge)
+    if vals.size == 0:
         vals = roi_img[~roi_mask]
     if vals.size == 0:
         return 0.0
 
-    # Optional sub-sampling for huge rings (median is robust)
     if vals.size > max_samples:
         idx = np.random.randint(0, vals.size, size=max_samples, dtype=np.int64)
         vals = vals[idx]
 
     return float(np.median(vals) if method == "median" else float(vals.mean()))
+
 # ----------------------------
 # Mask builder (Fiji-like path)
 # ----------------------------
@@ -280,22 +263,15 @@ def build_mask_fiji_like(
     dilate_iter: int,
     erode_iter: int,
     clear_border_artifacts: bool = True,
+    object_is_dark: bool = True,   # <--- NEW
 ) -> np.ndarray:
-    """
-    Reproduce the Fiji macro path with memory-friendly ops.
-      1) Threshold (isodata) on 8-bit gray -> dark core
-      2) Fill / Dilate^n / Fill / Erode^m / Fill
-      3) Gaussian Blur (sigma = sigma_pre) on float32
-      4) Auto-threshold again (keep object)
-    """
     gray = rgb_to_gray_ij_u8(img_rgb)
 
-    # Step 1: initial threshold (assume darker organoid)
+    # --- initial threshold ---
     t1 = filters.threshold_isodata(gray)
-    core = gray <= t1
+    core = (gray <= t1) if object_is_dark else (gray >= t1)
     core = ndi.binary_fill_holes(core)
 
-    # Morphology: dilate, fill, erode, fill
     se = footprint_rectangle((3, 3))
     for _ in range(int(dilate_iter)):
         core = morphology.binary_dilation(core, footprint=se)
@@ -304,43 +280,40 @@ def build_mask_fiji_like(
         core = morphology.binary_erosion(core, footprint=se)
     core = ndi.binary_fill_holes(core)
 
-    # Gaussian on float32
+    # blur & re-threshold
     core_f32 = core.astype(np.float32, copy=False)
     soft_f32 = np.empty_like(core_f32, dtype=np.float32)
     ndi.gaussian_filter(core_f32, sigma=sigma_pre, output=soft_f32, mode="nearest")
 
-    # Second threshold: keep object (>=), not background
     t2_u8 = filters.threshold_isodata((soft_f32 * 255).astype(np.uint8))
     thr = t2_u8 / 255.0
-    final = soft_f32 >= thr
+    final = (soft_f32 <= thr) if object_is_dark else (soft_f32 >= thr)
 
     if clear_border_artifacts:
         final = clear_border(final)
 
-    # Safety: if >80% of frame is foreground, flip (rare inversion cases)
+    # rare inversion guard
     if final.mean() > 0.8:
         final = ~final
 
     return final
 
-# helper to parse day/organoid from filename
+
+# ----------------------------
+# Filename parsing (optional growth-rate)
+# ----------------------------
 FILENAME_RE = re.compile(r"_d(?P<day>\d{2})_(?P<organoid>\d{1,3})(?=\.)")
 
 def parse_day_organoid(fname: str) -> Tuple[str | None, str | None]:
-    """
-    Extract day ('00') and organoid number ('008') from filenames like:
-      YYYY-MM-DD_d00_08.jpg
-    Returns zero-padded strings or (None, None) if not matched.
-    """
     m = FILENAME_RE.search(fname or "")
     if not m:
         return None, None
     day = m.group("day")
-    organoid = m.group("organoid").zfill(3)  # Fiji-style 3-digit
+    organoid = m.group("organoid").zfill(3)
     return day, organoid
 
 # ----------------------------
-# Core analysis
+# Core analysis (supports both BF & FL via args)
 # ----------------------------
 def analyze_image(
     img: np.ndarray,
@@ -358,24 +331,35 @@ def analyze_image(
     crop_overlay: bool,
     crop_border_px: int,
     ring_px: int,
+    # differences between BF and FL:
+    invert_for_intensity: bool,
+    exclude_edge_particles: bool,
+    select_strategy: Literal["largest", "composite_filtered"],
+    area_filter_px: Optional[float],
+    background_mode: Literal["ring", "inverse_of_composite"],
+    object_is_dark: bool,
 ) -> Dict[str, Any]:
-    H, W, _ = img.shape
-    logger.info(f"Analyze start | shape={H}x{W} sigma={sigma_pre} dilate={dilate_iter} erode={erode_iter} px_um={pixel_size_um}")
 
-    # Optional border crop
+    H, W, _ = img.shape
+    logger.info(
+        f"Analyze start | {H}x{W} σ={sigma_pre} dilate={dilate_iter} erode={erode_iter} "
+        f"minArea={min_area_px} minCirc={min_circ} edgeMargin={edge_margin}"
+    )
+
+    # Optional border crop (both modes)
     with time_block("optional border crop"):
         if crop_border_px > 0 and min(img.shape[:2]) > 2 * crop_border_px:
             img = img[crop_border_px:-crop_border_px, crop_border_px:-crop_border_px, :]
             H, W, _ = img.shape
-            logger.debug(f"Cropped border -> {H}x{W}")
 
-    # Build mask
+    # Build mask (common)
     with time_block("build_mask_fiji_like"):
         mask_bool = build_mask_fiji_like(
             img_rgb=img,
             sigma_pre=sigma_pre,
             dilate_iter=dilate_iter,
             erode_iter=erode_iter,
+            object_is_dark = object_is_dark,
         )
 
     with time_block("label mask + regionprops (initial)"):
@@ -387,6 +371,7 @@ def analyze_image(
     xmin, xmax = W * edge_margin, W * (1.0 - edge_margin)
     ymin, ymax = H * edge_margin, H * (1.0 - edge_margin)
 
+    # Filter components (area, circularity, centroid-in-margin if requested)
     with time_block("filter components"):
         keep_mask = np.zeros_like(labels, dtype=bool)
         for r in measure.regionprops(labels):
@@ -397,36 +382,60 @@ def analyze_image(
             circ_f = (4.0 * math.pi * a_px) / (p_px * p_px) if p_px > 0 else 0.0
             if circ_f < min_circ:
                 continue
-            cy, cx = r.centroid
-            if not (xmin <= cx <= xmax and ymin <= cy <= ymax):
-                continue
-            keep_mask |= labels == r.label
+            if exclude_edge_particles:
+                cy, cx = r.centroid
+                if not (xmin <= cx <= xmax and ymin <= cy <= ymax):
+                    continue
+            keep_mask |= (labels == r.label)
+
+        # Fluorescence: drop small ROIs after first pass (composite filter)
+        if area_filter_px is not None and keep_mask.any():
+            lab2 = measure.label(keep_mask, connectivity=2)
+            keep2 = np.zeros_like(keep_mask, dtype=bool)
+            for r in measure.regionprops(lab2):
+                if float(r.area) >= float(area_filter_px):
+                    keep2 |= (lab2 == r.label)
+            keep_mask = keep2
 
     with time_block("fallback to largest (if needed)"):
         if not keep_mask.any():
             largest = max(measure.regionprops(labels), key=lambda rr: rr.area)
             logger.info("Filters removed all; falling back to largest region")
-            keep_mask = labels == largest.label
+            keep_mask = (labels == largest.label)
 
-    # Measurements in px
+    # Selection strategy
     with time_block("regionprops (final) + measurements"):
-        union_lab = measure.label(keep_mask, connectivity=2)
-        props_list = measure.regionprops(union_lab)
-        if not props_list:
-            logger.error("Empty ROI after masking")
-            raise HTTPException(422, "Empty ROI after masking")
-        props = props_list[0]
-        area_px = float(props.area)
-        perim_px = float(perimeter_crofton(keep_mask, directions=4))
-        minr, minc, maxr, maxc = props.bbox
-        cy_px, cx_px = props.centroid
-        major_px = float(props.major_axis_length or 0.0)
-        minor_px = float(props.minor_axis_length or 0.0)
-        angle = float(np.degrees(props.orientation or 0.0))
+        if select_strategy == "largest":
+            union_lab = measure.label(keep_mask, connectivity=2)
+            regs = measure.regionprops(union_lab)
+            if not regs:
+                raise HTTPException(422, "Empty ROI after masking")
+            props = max(regs, key=lambda r: r.area)
+            mask_measured = (union_lab == props.label)
+            major_px = float(props.major_axis_length or 0.0)
+            minor_px = float(props.minor_axis_length or 0.0)
+            angle = float(np.degrees(props.orientation or 0.0))
+            solidity = float(getattr(props, "solidity", 0.0))
+            minr, minc, maxr, maxc = props.bbox
+            cy_px, cx_px = props.centroid
+        else:
+            # composite union
+            mask_measured = keep_mask
+            ys, xs = np.nonzero(mask_measured)
+            if ys.size == 0:
+                raise HTTPException(422, "Empty ROI after masking")
+            minr, maxr = int(ys.min()), int(ys.max())
+            minc, maxc = int(xs.min()), int(xs.max())
+            # centroid of geometry for generality
+            cy_px, cx_px = float(ys.mean()), float(xs.mean())
+            major_px = minor_px = angle = solidity = 0.0
 
-    # Feret from boundary points
+        area_px = float(mask_measured.sum())
+        perim_px = float(perimeter_crofton(mask_measured, directions=4))
+
+    # Feret from boundary points (works for both strategies)
     with time_block("feret from contours"):
-        contours = measure.find_contours(keep_mask, 0.5)
+        contours = measure.find_contours(mask_measured, 0.5)
         if contours:
             cont = max(contours, key=lambda c: c.shape[0])
             if cont.shape[0] > 4000:
@@ -448,23 +457,22 @@ def analyze_image(
     major, minor = major_px * px_um, minor_px * px_um
     feret, minFeret = feret_px * px_um, minFeret_px * px_um
     feretX, feretY = feretX_px * px_um, feretY_px * px_um
-    bx_px, by_px = float(props.bbox[1]), float(props.bbox[0])
-    width_px, height_px = float(props.bbox[3] - props.bbox[1]), float(props.bbox[2] - props.bbox[0])
+    bx_px, by_px = float(minc), float(minr)
+    width_px, height_px = float(maxc - minc), float(maxr - minr)
     bx, by = bx_px * px_um, by_px * px_um
     width, height = width_px * px_um, height_px * px_um
 
     circ = (4.0 * math.pi * area) / (perim * perim) if perim > 0 else 0.0
-    solidity = float(props.solidity) if hasattr(props, "solidity") else 0.0
     ar = float(major / minor) if minor > 0 else 0.0
     roundness = float((4.0 * area) / (math.pi * major * major)) if major > 0 else 0.0
 
-    # Intensity stats on inverted ImageJ gray (8-bit)
-    with time_block("intensity stats (inverted gray) + COM"):
+    # Intensity stats
+    with time_block("intensity stats + COM"):
         gray_u8 = rgb_to_gray_ij_u8(img)
-        stat_img = (255 - gray_u8).astype(np.uint8)
-        vals = stat_img[keep_mask].astype(np.uint8)
+        stat_img = (255 - gray_u8).astype(np.uint8) if invert_for_intensity else gray_u8
+        vals = stat_img[mask_measured].astype(np.uint8)
         if vals.size == 0:
-            raise HTTPException(422, "Empty ROI after masking (no intensity values)")
+            raise HTTPException(422, "Empty ROI (no intensity)")
 
         mean   = float(vals.mean())
         median = float(np.median(vals))
@@ -479,43 +487,42 @@ def analyze_image(
         else:
             skew = kurt = 0.0
 
-        rawIntDen = float(vals.sum())  # Integrated intensity
+        rawIntDen = float(vals.sum())
         intDen    = rawIntDen
-
-        # Intensity-weighted centroid (XM, YM) on inverted gray (in µm)
-        ym_px, xm_px = ndi.center_of_mass(stat_img, labels=keep_mask.astype(np.uint8), index=1)
+        ym_px, xm_px = ndi.center_of_mass(stat_img, labels=mask_measured.astype(np.uint8), index=1)
         xm, ym = float(xm_px * px_um), float(ym_px * px_um)
 
-    # Background ring + corrected metrics
-    with time_block("background ring + corrected metrics"):
-        bg = ring_background_mean(
-            stat_img,
-            keep_mask,
-            ring_px=ring_px,
-            method="median",
-            bbox=(minr, minc, maxr, maxc),  # <-- uses the ROI you already computed
-            # algo="edt",  # default; fastest
-        )
+    # Background + corrected metrics
+    with time_block("background + corrected metrics"):
+        if background_mode == "ring":
+            bg = ring_background_mean(
+                stat_img, mask_measured, ring_px=ring_px, method="median",
+                bbox=(int(by_px), int(bx_px), int(by_px + height_px), int(bx_px + width_px))
+            )
+        else:
+            roi_img = stat_img[int(by_px):int(by_px+height_px), int(bx_px):int(bx_px+width_px)]
+            roi_mask_inv = ~mask_measured[int(by_px):int(by_px+height_px), int(bx_px):int(bx_px+width_px)]
+            vals_bg = roi_img[roi_mask_inv]
+            bg = float(np.median(vals_bg)) if vals_bg.size else 0.0
+
         corrected_total_intensity = rawIntDen - bg * area_px
         corrected_mean_intensity  = mean - bg
         corrected_min_intensity   = vmin - bg
         corrected_max_intensity   = vmax - bg
-
-        # Extra derived metrics
         eq_diam = math.sqrt(4.0 * area / math.pi)
         centroid_to_com = math.hypot(float(xm - cx), float(ym - cy))
 
-    # ---------- Visual overlays ----------
+    # Overlays
     with time_block("build overlays" if return_images else "skip overlays"):
         if return_images:
             if crop_overlay:
-                local_mask = keep_mask[minr:maxr, minc:maxc]
-                overlay = img[minr:maxr, minc:maxc].copy()
+                local_mask = mask_measured[int(by_px):int(by_px+height_px), int(bx_px):int(bx_px+width_px)]
+                overlay = img[int(by_px):int(by_px+height_px), int(bx_px):int(bx_px+width_px)].copy()
                 boundaries = segmentation.find_boundaries(local_mask, mode="outer")
             else:
-                local_mask = keep_mask
+                local_mask = mask_measured
                 overlay = img.copy()
-                boundaries = segmentation.find_boundaries(keep_mask, mode="outer")
+                boundaries = segmentation.find_boundaries(local_mask, mode="outer")
             boundaries = morphology.binary_dilation(boundaries, disk(max(1, overlay_width // 2)))
             overlay[boundaries] = np.array([255, 0, 255], dtype=np.uint8)
             mask_vis = (local_mask.astype(np.uint8) * 255)
@@ -525,16 +532,14 @@ def analyze_image(
             roi_image_b64 = ""
             mask_image_b64 = ""
 
-    # Unified results mapping (frontend can format Fiji headers)
     results = {
         "area": area, "mean": mean, "stdDev": stdDev, "mode": mode, "min": vmin, "max": vmax,
         "x": cx, "y": cy, "xm": xm, "ym": ym, "perim": perim, "bx": bx, "by": by,
         "width": width, "height": height, "major": major, "minor": minor, "angle": angle,
-        "circ": circ, "feret": feret, "intDen": intDen, "median": median, "skew": -skew,  # keep your legacy sign
+        "circ": circ, "feret": feret, "intDen": intDen, "median": median, "skew": -skew,
         "kurt": kurt, "rawIntDen": rawIntDen, "feretX": feretX, "feretY": feretY,
         "feretAngle": feretAngle, "minFeret": minFeret, "ar": ar, "round": roundness,
         "solidity": solidity,
-        # --- Added fields for Fiji-style export ---
         "eqDiam": eq_diam,
         "corrTotalInt": corrected_total_intensity,
         "corrMeanInt": corrected_mean_intensity,
@@ -552,65 +557,109 @@ def analyze_image(
     }
 
 # ----------------------------
-# API route (thin wrapper)
+# Endpoint presets (Option A)
 # ----------------------------
-@api.post("/analyze")
-async def analyze(
+
+def brightfield_defaults() -> Dict[str, Any]:
+    return dict(
+        sigma_pre=6.4,
+        dilate_iter=4,
+        erode_iter=5,
+        min_area_px=60_000,
+        max_area_px=20_000_000,
+        min_circ=0.28,
+        edge_margin=0.20,
+        pixel_size_um=0.86,
+        overlay_width=11,
+        return_images=True,
+        crop_overlay=False,
+        crop_border_px=2,
+        ring_px=20,
+        invert_for_intensity=True,
+        exclude_edge_particles=True,
+        select_strategy="largest",
+        area_filter_px=None,
+        background_mode="ring",
+        object_is_dark=True,
+    )
+
+def fluorescence_defaults() -> Dict[str, Any]:
+    return dict(
+        sigma_pre=10.0,
+        dilate_iter=25,
+        erode_iter=0,
+        min_area_px=1_000,
+        max_area_px=10_000_000,
+        min_circ=0.0,
+        edge_margin=0.0,
+        pixel_size_um=1.0,
+        overlay_width=11,
+        return_images=True,
+        crop_overlay=False,
+        crop_border_px=2,
+        ring_px=20,
+        invert_for_intensity=False,
+        exclude_edge_particles=False,
+        select_strategy="composite_filtered",
+        area_filter_px=33_000,
+        background_mode="inverse_of_composite",
+        object_is_dark=False,
+    )
+
+# ----------------------------
+# API routes (Option A)
+# ----------------------------
+
+@api.post("/analyze/brightfield")
+async def analyze_brightfield(
     file: UploadFile = File(...),
-    # Fiji-like knobs
-    sigma_pre: float = Query(6.4, ge=0.0),
-    dilate_iter: int = Query(4, ge=0),
-    erode_iter: int = Query(5, ge=0),
-    min_area_px: float = Query(60000, ge=0),
-    max_area_px: float = Query(2.0e7, ge=0),
-    min_circ: float   = Query(0.28, ge=0.0, le=1.0),
-    edge_margin: float = Query(0.20, ge=0.0, le=0.49),
-    pixel_size_um: float = Query(0.86, gt=0.0),
-    overlay_width: int = Query(11, ge=1),
-    return_images: bool = Query(True),
-    crop_overlay: bool = Query(False, description="Return cropped overlay (bbox) instead of full frame"),
-    crop_border_px: int = Query(2, ge=0, description="Border pixels to crop before analysis"),
-    ring_px: int = Query(20, ge=1, description="Background ring thickness in pixels"),
+    # Optional overrides (keep minimal; defaults are good)
+    sigma_pre: float = Query(brightfield_defaults()["sigma_pre"], ge=0.0),
+    dilate_iter: int = Query(brightfield_defaults()["dilate_iter"], ge=0),
+    erode_iter: int = Query(brightfield_defaults()["erode_iter"], ge=0),
+    min_area_px: float = Query(brightfield_defaults()["min_area_px"], ge=0),
+    min_circ: float   = Query(brightfield_defaults()["min_circ"], ge=0.0, le=1.0),
+    edge_margin: float = Query(brightfield_defaults()["edge_margin"], ge=0.0, le=0.49),
+    pixel_size_um: float = Query(brightfield_defaults()["pixel_size_um"], gt=0.0),
+    return_images: bool = Query(brightfield_defaults()["return_images"]),
     profile: bool = Query(False),
+    # growth-rate aids
     day0_area: float | None = Form(None),
     mean_day0_area: float | None = Form(None),
     day0_area_by_organoid: str | None = Form(None),
 ) -> Dict[str, Any]:
+
     with time_block("read upload bytes"):
         data = await file.read()
     filename = file.filename or ""
-    logger.info(f"Received file: filename={file.filename!r} size={len(data)} bytes")
+    logger.info(f"Received BF file: {filename!r} ({len(data)} bytes)")
 
     day, organoid_number = parse_day_organoid(filename)
 
-    with time_block("PIL decode + to RGB + np.array"):
+    with time_block("PIL decode + to RGB"):
         try:
             img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
         except Exception:
-            logger.exception("Invalid image payload")
+            logger.exception("Invalid image payload (BF)")
             raise HTTPException(400, "Invalid image")
 
-    # Full analysis (already has ResourceProfiler)
-    with ResourceProfiler("analyze") as prof:
-        with time_block("analyze_image total"):
-            payload = analyze_image(
-                img,
-                sigma_pre=sigma_pre,
-                dilate_iter=dilate_iter,
-                erode_iter=erode_iter,
-                min_area_px=min_area_px,
-                max_area_px=max_area_px,
-                min_circ=min_circ,
-                edge_margin=edge_margin,
-                pixel_size_um=pixel_size_um,
-                overlay_width=overlay_width,
-                return_images=return_images,
-                crop_overlay=crop_overlay,
-                crop_border_px=crop_border_px,
-                ring_px=ring_px,
-            )
+    params = brightfield_defaults()
+    params.update(
+        sigma_pre=sigma_pre,
+        dilate_iter=dilate_iter,
+        erode_iter=erode_iter,
+        min_area_px=min_area_px,
+        min_circ=min_circ,
+        edge_margin=edge_margin,
+        pixel_size_um=pixel_size_um,
+        return_images=return_images,
+    )
 
-    # growth rate & profile (unchanged, but you can time too if you like)
+    with ResourceProfiler("analyze_brightfield") as prof:
+        with time_block("analyze_image total"):
+            payload = analyze_image(img, **params)
+
+    # growth rate compute (BF only)
     with time_block("growth-rate compute"):
         area_value = float(payload["results"]["area"])
         growth_rate = None
@@ -637,6 +686,7 @@ async def analyze(
         payload["results"]["day"] = day
         payload["results"]["organoidNumber"] = organoid_number
         payload["results"]["growthRate"] = growth_rate
+        payload["results"]["mode"] = "brightfield"
 
         if profile and prof.metrics:
             payload["profile"] = prof.metrics
@@ -644,6 +694,52 @@ async def analyze(
     return payload
 
 
+@api.post("/analyze/fluorescence")
+async def analyze_fluorescence(
+    file: UploadFile = File(...),
+    # A few sensible overrides if needed:
+    sigma_pre: float = Query(fluorescence_defaults()["sigma_pre"], ge=0.0),
+    dilate_iter: int = Query(fluorescence_defaults()["dilate_iter"], ge=0),
+    erode_iter: int = Query(fluorescence_defaults()["erode_iter"], ge=0),
+    area_filter_px: float = Query(fluorescence_defaults()["area_filter_px"], ge=0),
+    return_images: bool = Query(fluorescence_defaults()["return_images"]),
+    profile: bool = Query(False),
+) -> Dict[str, Any]:
+
+    with time_block("read upload bytes"):
+        data = await file.read()
+    filename = file.filename or ""
+    logger.info(f"Received FL file: {filename!r} ({len(data)} bytes)")
+
+    with time_block("PIL decode + to RGB"):
+        try:
+            img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+        except Exception:
+            logger.exception("Invalid image payload (FL)")
+            raise HTTPException(400, "Invalid image")
+
+    params = fluorescence_defaults()
+    params.update(
+        sigma_pre=sigma_pre,
+        dilate_iter=dilate_iter,
+        erode_iter=erode_iter,
+        area_filter_px=area_filter_px,
+        return_images=return_images,
+    )
+
+    with ResourceProfiler("analyze_fluorescence") as prof:
+        with time_block("analyze_image total"):
+            payload = analyze_image(img, **params)
+
+    # Tag mode; growth-rate not relevant here
+    payload["results"]["mode"] = "fluorescence"
+    if profile and prof.metrics:
+        payload["profile"] = prof.metrics
+    return payload
+
+# ----------------------------
+# Request timing middleware
+# ----------------------------
 @api.middleware("http")
 async def log_request_timing(request, call_next):
     t0 = time.perf_counter()
