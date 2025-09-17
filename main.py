@@ -263,15 +263,23 @@ def build_mask_fiji_like(
     dilate_iter: int,
     erode_iter: int,
     clear_border_artifacts: bool = True,
-    object_is_dark: bool = True,   # <--- NEW
+    object_is_dark: bool = True,
 ) -> np.ndarray:
+    """
+    Fiji-like mask builder:
+    1) Threshold (isodata) on 8-bit gray -> 'core' (object=True).
+        Uses `object_is_dark` ONLY here.
+    2) Fill / Dilate^n / Fill / Erode^m / Fill
+    3) Gaussian blur (float32)
+    4) Auto-threshold again on the blurred core and KEEP THE HIGH SIDE (always)
+    """
+    # 1) Initial threshold on ImageJ-style grayscale
     gray = rgb_to_gray_ij_u8(img_rgb)
-
-    # --- initial threshold ---
     t1 = filters.threshold_isodata(gray)
     core = (gray <= t1) if object_is_dark else (gray >= t1)
     core = ndi.binary_fill_holes(core)
 
+    # 2) Morphology (3x3 rectangle)
     se = footprint_rectangle((3, 3))
     for _ in range(int(dilate_iter)):
         core = morphology.binary_dilation(core, footprint=se)
@@ -280,19 +288,20 @@ def build_mask_fiji_like(
         core = morphology.binary_erosion(core, footprint=se)
     core = ndi.binary_fill_holes(core)
 
-    # blur & re-threshold
+    # 3) Blur on float32 (memory-friendly, in-place output)
     core_f32 = core.astype(np.float32, copy=False)
     soft_f32 = np.empty_like(core_f32, dtype=np.float32)
     ndi.gaussian_filter(core_f32, sigma=sigma_pre, output=soft_f32, mode="nearest")
 
+    # 4) Second threshold: ALWAYS keep the high side of blurred core
     t2_u8 = filters.threshold_isodata((soft_f32 * 255).astype(np.uint8))
     thr = t2_u8 / 255.0
-    final = (soft_f32 <= thr) if object_is_dark else (soft_f32 >= thr)
+    final = (soft_f32 >= thr)
 
     if clear_border_artifacts:
         final = clear_border(final)
 
-    # rare inversion guard
+    # Safety: if >80% of frame is foreground, flip (rare inversion)
     if final.mean() > 0.8:
         final = ~final
 
@@ -686,7 +695,7 @@ async def analyze_brightfield(
         payload["results"]["day"] = day
         payload["results"]["organoidNumber"] = organoid_number
         payload["results"]["growthRate"] = growth_rate
-        payload["results"]["mode"] = "brightfield"
+        payload["results"]["type"] = "brightfield"
 
         if profile and prof.metrics:
             payload["profile"] = prof.metrics
@@ -732,7 +741,7 @@ async def analyze_fluorescence(
             payload = analyze_image(img, **params)
 
     # Tag mode; growth-rate not relevant here
-    payload["results"]["mode"] = "fluorescence"
+    payload["results"]["type"] = "fluorescence"
     if profile and prof.metrics:
         payload["profile"] = prof.metrics
     return payload
