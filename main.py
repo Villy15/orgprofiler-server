@@ -77,6 +77,15 @@ def time_block(label: str):
         dt = time.perf_counter() - _t0
         logger.info(f"[TIMER] {label}: {dt:.3f}s")
 
+
+@contextlib.contextmanager
+def timed(timings: Dict[str, float], key: str):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[key] = round(time.perf_counter() - t0, 6)
+
 class ResourceProfiler:
     def __init__(self, label: str = "analyze"):
         self.label = label
@@ -637,15 +646,18 @@ async def analyze_brightfield(
     mean_day0_area: float | None = Form(None),
     day0_area_by_organoid: str | None = Form(None),
 ) -> Dict[str, Any]:
+    
+    timings: Dict[str, float] = {}
 
-    with time_block("read upload bytes"):
+
+    with timed(timings, "upload_read_s"), time_block("read upload bytes"):
         data = await file.read()
     filename = file.filename or ""
     logger.info(f"Received BF file: {filename!r} ({len(data)} bytes)")
 
     day, organoid_number = parse_day_organoid(filename)
 
-    with time_block("PIL decode + to RGB"):
+    with timed(timings, "decode_rgb_s"), time_block("PIL decode + to RGB"):
         try:
             img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
         except Exception:
@@ -665,11 +677,11 @@ async def analyze_brightfield(
     )
 
     with ResourceProfiler("analyze_brightfield") as prof:
-        with time_block("analyze_image total"):
+        with timed(timings, "analyze_total_s"), time_block("analyze_image total"):
             payload = analyze_image(img, **params)
 
     # growth rate compute (BF only)
-    with time_block("growth-rate compute"):
+    with timed(timings, "postprocess_s"), time_block("growth-rate compute"):
         area_value = float(payload["results"]["area"])
         growth_rate = None
         if day == "00":
@@ -700,6 +712,17 @@ async def analyze_brightfield(
         if profile and prof.metrics:
             payload["profile"] = prof.metrics
 
+        # attach timings
+        payload["timings"] = {
+            # top-level “stages” you asked for:
+            "upload_s": timings.get("upload_read_s"),
+            "analyze_s": timings.get("analyze_total_s"),
+            "calculation_s": timings.get("postprocess_s"),
+            # helpful extras:
+            "decode_rgb_s": timings.get("decode_rgb_s"),
+            "total_request_s": round(sum(v for v in timings.values() if isinstance(v, (int, float))), 6)
+        }
+
     return payload
 
 
@@ -713,14 +736,22 @@ async def analyze_fluorescence(
     area_filter_px: float = Query(fluorescence_defaults()["area_filter_px"], ge=0),
     return_images: bool = Query(fluorescence_defaults()["return_images"]),
     profile: bool = Query(False),
+    day0_area: float | None = Form(None),
+    mean_day0_area: float | None = Form(None),
+    day0_area_by_organoid: str | None = Form(None),
 ) -> Dict[str, Any]:
+    
+    timings: Dict[str, float] = {}
 
-    with time_block("read upload bytes"):
+
+    with timed(timings, "upload_read_s"), time_block("read upload bytes"):
         data = await file.read()
     filename = file.filename or ""
     logger.info(f"Received FL file: {filename!r} ({len(data)} bytes)")
 
-    with time_block("PIL decode + to RGB"):
+    day, organoid_number = parse_day_organoid(filename)
+
+    with timed(timings, "decode_rgb_s"), time_block("PIL decode + to RGB"):
         try:
             img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
         except Exception:
@@ -737,13 +768,53 @@ async def analyze_fluorescence(
     )
 
     with ResourceProfiler("analyze_fluorescence") as prof:
-        with time_block("analyze_image total"):
+        with timed(timings, "analyze_total_s"), time_block("analyze_image total"):
             payload = analyze_image(img, **params)
 
-    # Tag mode; growth-rate not relevant here
-    payload["results"]["type"] = "fluorescence"
-    if profile and prof.metrics:
-        payload["profile"] = prof.metrics
+
+     # growth rate compute (BF only)
+    with timed(timings, "postprocess_s"), time_block("growth-rate compute"):
+        area_value = float(payload["results"]["area"])
+        growth_rate = None
+        if day == "00":
+            growth_rate = 1.0
+        else:
+            baseline = None
+            if day0_area_by_organoid:
+                try:
+                    mapping = json.loads(day0_area_by_organoid)
+                    if isinstance(mapping, dict) and organoid_number:
+                        maybe = mapping.get(organoid_number)
+                        if isinstance(maybe, (int, float)):
+                            baseline = float(maybe)
+                except Exception:
+                    logger.warning("Invalid JSON for day0_area_by_organoid; ignoring")
+            if baseline is None and day0_area is not None:
+                baseline = float(day0_area)
+            if baseline is None and mean_day0_area is not None:
+                baseline = float(mean_day0_area)
+            if baseline and baseline > 0:
+                growth_rate = area_value / baseline
+
+        payload["results"]["day"] = day
+        payload["results"]["organoidNumber"] = organoid_number
+        payload["results"]["growthRate"] = growth_rate
+        payload["results"]["type"] = "brightfield"
+
+        if profile and prof.metrics:
+            payload["profile"] = prof.metrics
+
+        # attach timings
+        payload["timings"] = {
+            # top-level “stages” you asked for:
+            "upload_s": timings.get("upload_read_s"),
+            "analyze_s": timings.get("analyze_total_s"),
+            "calculation_s": timings.get("postprocess_s"),
+            # helpful extras:
+            "decode_rgb_s": timings.get("decode_rgb_s"),
+            "total_request_s": round(sum(v for v in timings.values() if isinstance(v, (int, float))), 6)
+        }
+
     return payload
 
 # ----------------------------
