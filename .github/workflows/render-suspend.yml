@@ -1,0 +1,28 @@
+name: Render • Suspend daily (PH 21:00)
+
+on:
+  schedule:
+    # 21:00 Asia/Manila = 13:00 UTC
+    - cron: "0 13 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  suspend:
+    runs-on: ubuntu-latest
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }} # e.g., srv-abc123
+    steps:
+      - name: Check required secrets
+        run: |
+          test -n "$RENDER_API_KEY" || { echo "Missing RENDER_API_KEY"; exit 1; }
+          test -n "$SERVICE_ID"     || { echo "Missing RENDER_SERVICE_ID"; exit 1; }
+
+      - name: Suspend service
+        run: |
+          echo "Suspending ${SERVICE_ID}"
+          curl -fsS -X POST \
+            --url "https://api.render.com/v1/services/${SERVICE_ID}/suspend" \
+            --header "accept: application/json" \
+            --header "Authorization: Bearer ${RENDER_API_KEY}"
+          echo "OK"
