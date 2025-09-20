@@ -1,9 +1,9 @@
 name: Render • Suspend daily (PH 21:00)
 
 on:
-  schedule:
-    # 21:00 Asia/Manila = 13:00 UTC
-    - cron: "0 13 * * *"
+  # schedule:
+  #   # 21:00 Asia/Manila = 13:00 UTC
+  #   - cron: "0 13 * * *"
   workflow_dispatch: {}
 
 jobs:
