@@ -713,15 +713,13 @@ async def analyze_brightfield(
             payload["profile"] = prof.metrics
 
         # attach timings
-        payload["timings"] = {
-            # top-level “stages” you asked for:
+        payload["results"].update({  
             "upload_s": timings.get("upload_read_s"),
             "analyze_s": timings.get("analyze_total_s"),
             "calculation_s": timings.get("postprocess_s"),
-            # helpful extras:
             "decode_rgb_s": timings.get("decode_rgb_s"),
             "total_request_s": round(sum(v for v in timings.values() if isinstance(v, (int, float))), 6)
-        }
+        })
 
     return payload
 
@@ -805,15 +803,13 @@ async def analyze_fluorescence(
             payload["profile"] = prof.metrics
 
         # attach timings
-        payload["timings"] = {
-            # top-level “stages” you asked for:
+        payload["results"].update({  
             "upload_s": timings.get("upload_read_s"),
             "analyze_s": timings.get("analyze_total_s"),
             "calculation_s": timings.get("postprocess_s"),
-            # helpful extras:
             "decode_rgb_s": timings.get("decode_rgb_s"),
             "total_request_s": round(sum(v for v in timings.values() if isinstance(v, (int, float))), 6)
-        }
+        })
 
     return payload
 
