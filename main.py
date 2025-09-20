@@ -277,18 +277,16 @@ def build_mask_fiji_like(
     """
     Fiji-like mask builder:
     1) Threshold (isodata) on 8-bit gray -> 'core' (object=True).
-        Uses `object_is_dark` ONLY here.
+       Uses `object_is_dark` ONLY here.
     2) Fill / Dilate^n / Fill / Erode^m / Fill
     3) Gaussian blur (float32)
     4) Auto-threshold again on the blurred core and KEEP THE HIGH SIDE (always)
     """
-    # 1) Initial threshold on ImageJ-style grayscale
     gray = rgb_to_gray_ij_u8(img_rgb)
     t1 = filters.threshold_isodata(gray)
     core = (gray <= t1) if object_is_dark else (gray >= t1)
     core = ndi.binary_fill_holes(core)
 
-    # 2) Morphology (3x3 rectangle)
     se = footprint_rectangle((3, 3))
     for _ in range(int(dilate_iter)):
         core = morphology.binary_dilation(core, footprint=se)
@@ -297,12 +295,10 @@ def build_mask_fiji_like(
         core = morphology.binary_erosion(core, footprint=se)
     core = ndi.binary_fill_holes(core)
 
-    # 3) Blur on float32 (memory-friendly, in-place output)
     core_f32 = core.astype(np.float32, copy=False)
     soft_f32 = np.empty_like(core_f32, dtype=np.float32)
     ndi.gaussian_filter(core_f32, sigma=sigma_pre, output=soft_f32, mode="nearest")
 
-    # 4) Second threshold: ALWAYS keep the high side of blurred core
     t2_u8 = filters.threshold_isodata((soft_f32 * 255).astype(np.uint8))
     thr = t2_u8 / 255.0
     final = (soft_f32 >= thr)
@@ -310,7 +306,6 @@ def build_mask_fiji_like(
     if clear_border_artifacts:
         final = clear_border(final)
 
-    # Safety: if >80% of frame is foreground, flip (rare inversion)
     if final.mean() > 0.8:
         final = ~final
 
@@ -356,6 +351,8 @@ def analyze_image(
     area_filter_px: Optional[float],
     background_mode: Literal["ring", "inverse_of_composite"],
     object_is_dark: bool,
+    # ---- NEW: fluorescence-only behavior toggle ----
+    ignore_zero_bins_for_mode_min: bool = False,
 ) -> Dict[str, Any]:
 
     H, W, _ = img.shape
@@ -377,7 +374,7 @@ def analyze_image(
             sigma_pre=sigma_pre,
             dilate_iter=dilate_iter,
             erode_iter=erode_iter,
-            object_is_dark = object_is_dark,
+            object_is_dark=object_is_dark,
         )
 
     with time_block("label mask + regionprops (initial)"):
@@ -442,11 +439,17 @@ def analyze_image(
             ys, xs = np.nonzero(mask_measured)
             if ys.size == 0:
                 raise HTTPException(422, "Empty ROI after masking")
-            minr, maxr = int(ys.min()), int(ys.max())
-            minc, maxc = int(xs.min()), int(xs.max())
-            # centroid of geometry for generality
-            cy_px, cx_px = float(ys.mean()), float(xs.mean())
-            major_px = minor_px = angle = solidity = 0.0
+
+            # Compute regionprops on the union-as-one-label
+            union_lbl = mask_measured.astype(np.uint8)  # all foreground = label 1
+            rp = measure.regionprops(union_lbl)[0]
+
+            minr, minc, maxr, maxc = rp.bbox
+            cy_px, cx_px = rp.centroid
+            major_px = float(rp.major_axis_length or 0.0)
+            minor_px = float(rp.minor_axis_length or 0.0)
+            angle    = float(np.degrees(rp.orientation or 0.0))
+            solidity = float(getattr(rp, "solidity", 0.0))
 
         area_px = float(mask_measured.sum())
         perim_px = float(perimeter_crofton(mask_measured, directions=4))
@@ -494,9 +497,19 @@ def analyze_image(
 
         mean   = float(vals.mean())
         median = float(np.median(vals))
-        mode   = float(np.bincount(vals).argmax())
-        vmin   = float(vals.min())
-        vmax   = float(vals.max())
+
+        # ---- fluorescence-only handling of mode/min ----
+        hist = np.bincount(vals, minlength=256)
+        if ignore_zero_bins_for_mode_min and hist[1:].sum() > 0:
+            mode = float(hist[1:].argmax() + 1)  # ignore 0-bin
+            vmin_pos = float(vals[vals > 0].min())
+        else:
+            mode = float(np.argmax(hist))
+            vmin_pos = float(vals.min())
+
+        vmin = float(vals.min())
+        vmax = float(vals.max())
+
         stdDev = float(vals.std(ddof=0))
         if stdDev > 0:
             z = (vals.astype(np.float32) - mean) / stdDev
@@ -525,7 +538,8 @@ def analyze_image(
 
         corrected_total_intensity = rawIntDen - bg * area_px
         corrected_mean_intensity  = mean - bg
-        corrected_min_intensity   = vmin - bg
+        # use positive-min only when the fluorescence flag is on
+        corrected_min_intensity   = (vmin_pos if ignore_zero_bins_for_mode_min else vmin) - bg
         corrected_max_intensity   = vmax - bg
         eq_diam = math.sqrt(4.0 * area / math.pi)
         centroid_to_com = math.hypot(float(xm - cx), float(ym - cy))
@@ -599,6 +613,7 @@ def brightfield_defaults() -> Dict[str, Any]:
         area_filter_px=None,
         background_mode="ring",
         object_is_dark=True,
+        ignore_zero_bins_for_mode_min=False,  # keep BF unchanged
     )
 
 def fluorescence_defaults() -> Dict[str, Any]:
@@ -622,6 +637,7 @@ def fluorescence_defaults() -> Dict[str, Any]:
         area_filter_px=33_000,
         background_mode="inverse_of_composite",
         object_is_dark=False,
+        ignore_zero_bins_for_mode_min=True,   # FL: ignore zero-bin for mode/min
     )
 
 # ----------------------------
@@ -631,7 +647,6 @@ def fluorescence_defaults() -> Dict[str, Any]:
 @api.post("/analyze/brightfield")
 async def analyze_brightfield(
     file: UploadFile = File(...),
-    # Optional overrides (keep minimal; defaults are good)
     sigma_pre: float = Query(brightfield_defaults()["sigma_pre"], ge=0.0),
     dilate_iter: int = Query(brightfield_defaults()["dilate_iter"], ge=0),
     erode_iter: int = Query(brightfield_defaults()["erode_iter"], ge=0),
@@ -641,14 +656,11 @@ async def analyze_brightfield(
     pixel_size_um: float = Query(brightfield_defaults()["pixel_size_um"], gt=0.0),
     return_images: bool = Query(brightfield_defaults()["return_images"]),
     profile: bool = Query(False),
-    # growth-rate aids
     day0_area: float | None = Form(None),
     mean_day0_area: float | None = Form(None),
     day0_area_by_organoid: str | None = Form(None),
 ) -> Dict[str, Any]:
-    
     timings: Dict[str, float] = {}
-
 
     with timed(timings, "upload_read_s"), time_block("read upload bytes"):
         data = await file.read()
@@ -680,7 +692,6 @@ async def analyze_brightfield(
         with timed(timings, "analyze_total_s"), time_block("analyze_image total"):
             payload = analyze_image(img, **params)
 
-    # growth rate compute (BF only)
     with timed(timings, "postprocess_s"), time_block("growth-rate compute"):
         area_value = float(payload["results"]["area"])
         growth_rate = None
@@ -712,16 +723,13 @@ async def analyze_brightfield(
         if profile and prof.metrics:
             payload["profile"] = prof.metrics
 
-        # attach timings
-        payload["timings"] = {
-            # top-level “stages” you asked for:
+        payload["results"].update({
             "upload_s": timings.get("upload_read_s"),
             "analyze_s": timings.get("analyze_total_s"),
             "calculation_s": timings.get("postprocess_s"),
-            # helpful extras:
             "decode_rgb_s": timings.get("decode_rgb_s"),
             "total_request_s": round(sum(v for v in timings.values() if isinstance(v, (int, float))), 6)
-        }
+        })
 
     return payload
 
@@ -729,7 +737,6 @@ async def analyze_brightfield(
 @api.post("/analyze/fluorescence")
 async def analyze_fluorescence(
     file: UploadFile = File(...),
-    # A few sensible overrides if needed:
     sigma_pre: float = Query(fluorescence_defaults()["sigma_pre"], ge=0.0),
     dilate_iter: int = Query(fluorescence_defaults()["dilate_iter"], ge=0),
     erode_iter: int = Query(fluorescence_defaults()["erode_iter"], ge=0),
@@ -740,9 +747,7 @@ async def analyze_fluorescence(
     mean_day0_area: float | None = Form(None),
     day0_area_by_organoid: str | None = Form(None),
 ) -> Dict[str, Any]:
-    
     timings: Dict[str, float] = {}
-
 
     with timed(timings, "upload_read_s"), time_block("read upload bytes"):
         data = await file.read()
@@ -771,8 +776,6 @@ async def analyze_fluorescence(
         with timed(timings, "analyze_total_s"), time_block("analyze_image total"):
             payload = analyze_image(img, **params)
 
-
-     # growth rate compute (BF only)
     with timed(timings, "postprocess_s"), time_block("growth-rate compute"):
         area_value = float(payload["results"]["area"])
         growth_rate = None
@@ -799,21 +802,18 @@ async def analyze_fluorescence(
         payload["results"]["day"] = day
         payload["results"]["organoidNumber"] = organoid_number
         payload["results"]["growthRate"] = growth_rate
-        payload["results"]["type"] = "brightfield"
+        payload["results"]["type"] = "fluorescence"   # bugfix
 
         if profile and prof.metrics:
             payload["profile"] = prof.metrics
 
-        # attach timings
-        payload["timings"] = {
-            # top-level “stages” you asked for:
+        payload["results"].update({
             "upload_s": timings.get("upload_read_s"),
             "analyze_s": timings.get("analyze_total_s"),
             "calculation_s": timings.get("postprocess_s"),
-            # helpful extras:
             "decode_rgb_s": timings.get("decode_rgb_s"),
             "total_request_s": round(sum(v for v in timings.values() if isinstance(v, (int, float))), 6)
-        }
+        })
 
     return payload
 
