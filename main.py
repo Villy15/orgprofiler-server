@@ -1,5 +1,6 @@
 # main.py
 from __future__ import annotations
+import datetime
 import json
 from typing import Tuple, Optional, Literal
 import contextlib
@@ -7,21 +8,44 @@ from functools import lru_cache
 
 import base64
 import io
+import os
 import math
 import re
 import sys
 from typing import Any, Dict
+from uuid import uuid4
 
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from scipy import ndimage as ndi
 from scipy.spatial import ConvexHull
 from skimage import filters, measure, morphology, segmentation
 from skimage.morphology import footprint_rectangle, disk
 from skimage.measure import perimeter_crofton
 from skimage.segmentation import clear_border
+from supabase import Client, create_client
+
+
+
+class Settings(BaseSettings):
+    SUPABASE_URL: str
+    SUPABASE_KEY: str
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False, 
+    )
+
+settings = Settings()
+
+url = settings.SUPABASE_URL
+key = settings.SUPABASE_KEY
+supabase: Client = create_client(url, key)
 
 # ----------------------------
 # Small utils
@@ -588,6 +612,97 @@ def analyze_image(
         "mask_image": mask_image_b64,
     }
 
+def _upload_png_dataurl_to_storage(bucket: str, path: str, data_url: str):
+    # data_url: "data:image/png;base64,...."
+    if not data_url:
+        return None
+    prefix = "base64,"
+    i = data_url.find(prefix)
+    if i < 0:
+        return None
+    b64 = data_url[i+len(prefix):]
+    binary = base64.b64decode(b64)
+    # overwrite: True so re-runs with same path replace
+    up = supabase.storage.from_(bucket).upload(
+        path=path, file=binary, file_options={"content-type": "image/png", "upsert": "true"}
+    )
+    if getattr(up, "error", None):
+        logger.warning(f"Storage upload failed for {path}: {up.error}")
+        return None
+    # public URL (configure bucket public or use signed URLs if private)
+    pub = supabase.storage.from_(bucket).get_public_url(path)
+    return pub
+
+def _result_row_from_payload(run_id: str, filename: str, payload: Dict[str, Any], analysis_type: str) -> Dict[str, Any]:
+    r = payload["results"]
+    return {
+        "run_id": run_id,
+        "filename": filename,
+        "analysis_type": analysis_type,
+        # Storage links (filled after upload)
+        "roi_image_path": None,
+        "mask_image_path": None,
+
+        # parsed ids / growth
+        "day": r.get("day"),
+        "organoid_number": r.get("organoidNumber"),
+        "growth_rate": r.get("growthRate"),
+
+        # metrics (map 1:1 with your table)
+        "area": r.get("area"),
+        "perim": r.get("perim"),
+        "eqDiam": r.get("eqDiam"),
+        "circ": r.get("circ"),
+        "ar": r.get("ar"),
+        "roundness": r.get("round"),
+        "solidity": r.get("solidity"),
+        "major": r.get("major"),
+        "minor": r.get("minor"),
+        "angle": r.get("angle"),
+        "feret": r.get("feret"),
+        "minFeret": r.get("minFeret"),
+        "feretAngle": r.get("feretAngle"),
+        "feretX": r.get("feretX"),
+        "feretY": r.get("feretY"),
+        "x": r.get("x"),
+        "y": r.get("y"),
+        "xm": r.get("xm"),
+        "ym": r.get("ym"),
+        "centroidToCom": r.get("centroidToCom"),
+        "bx": r.get("bx"),
+        "by": r.get("by"),
+        "width": r.get("width"),
+        "height": r.get("height"),
+        "mean": r.get("mean"),
+        "median": r.get("median"),
+        "mode": r.get("mode"),
+        "min": r.get("min"),
+        "max": r.get("max"),
+        "stdDev": r.get("stdDev"),
+        "skew": r.get("skew"),
+        "kurt": r.get("kurt"),
+        "rawIntDen": r.get("rawIntDen"),
+        "intDen": r.get("intDen"),
+        "corrTotalInt": r.get("corrTotalInt"),
+        "corrMeanInt": r.get("corrMeanInt"),
+        "corrMinInt": r.get("corrMinInt"),
+        "corrMaxInt": r.get("corrMaxInt"),
+        "bgRing": r.get("bgRing"),
+
+        # timings
+        "upload_s": r.get("upload_s"),
+        "analyze_s": r.get("analyze_s"),
+        "calculation_s": r.get("calculation_s"),
+        "decode_rgb_s": r.get("decode_rgb_s"),
+        "total_request_s": r.get("total_request_s"),
+
+        # raw dumps
+        "results_json": payload.get("results"),
+        "params_json": None,   # optionally capture the params you used
+        "profile_json": payload.get("profile"),
+    }
+
+
 # ----------------------------
 # Endpoint presets (Option A)
 # ----------------------------
@@ -659,6 +774,7 @@ async def analyze_brightfield(
     day0_area: float | None = Form(None),
     mean_day0_area: float | None = Form(None),
     day0_area_by_organoid: str | None = Form(None),
+    run_id: str | None = Query(None),
 ) -> Dict[str, Any]:
     timings: Dict[str, float] = {}
 
@@ -731,6 +847,31 @@ async def analyze_brightfield(
             "total_request_s": round(sum(v for v in timings.values() if isinstance(v, (int, float))), 6)
         })
 
+    if run_id:
+        try:
+            # 1) Upload overlays (prefer per-run folder)
+            bucket = "orgprofiler"
+            base = f"runs/{run_id}/{filename or 'image'}.png"
+            roi_path  = base.replace(".png", ".roi.png")
+            mask_path = base.replace(".png", ".mask.png")
+
+            roi_url  = _upload_png_dataurl_to_storage(bucket, roi_path, payload["roi_image"])
+            mask_url = _upload_png_dataurl_to_storage(bucket, mask_path, payload["mask_image"])
+
+            row = _result_row_from_payload(run_id, filename, payload, analysis_type="brightfield")
+            row["roi_image_path"] = roi_url or roi_path
+            row["mask_image_path"] = mask_url or mask_path
+
+            # 2) Insert result row
+            ins = supabase.table("analysis_results").insert(row).execute()
+            if getattr(ins, "error", None):
+                logger.warning(f"DB insert failed for run_id={run_id}: {ins.error}")
+            else:
+                # Optional: flip run to 'running' at first successful insert
+                supabase.table("analysis_runs").update({"status": "running"}).eq("id", run_id).execute()
+        except Exception:
+            logger.exception("Failed to persist analysis_result")
+
     return payload
 
 
@@ -746,6 +887,7 @@ async def analyze_fluorescence(
     day0_area: float | None = Form(None),
     mean_day0_area: float | None = Form(None),
     day0_area_by_organoid: str | None = Form(None),
+    run_id: str | None = Query(None),
 ) -> Dict[str, Any]:
     timings: Dict[str, float] = {}
 
@@ -815,6 +957,32 @@ async def analyze_fluorescence(
             "total_request_s": round(sum(v for v in timings.values() if isinstance(v, (int, float))), 6)
         })
 
+        if run_id:
+            try:
+                # 1) Upload overlays (prefer per-run folder)
+                bucket = "orgprofiler"
+                base = f"runs/{run_id}/{filename or 'image'}.png"
+                roi_path  = base.replace(".png", ".roi.png")
+                mask_path = base.replace(".png", ".mask.png")
+
+                roi_url  = _upload_png_dataurl_to_storage(bucket, roi_path, payload["roi_image"])
+                mask_url = _upload_png_dataurl_to_storage(bucket, mask_path, payload["mask_image"])
+
+                row = _result_row_from_payload(run_id, filename, payload, analysis_type="brightfield")
+                row["roi_image_path"] = roi_url or roi_path
+                row["mask_image_path"] = mask_url or mask_path
+
+                # 2) Insert result row
+                ins = supabase.table("analysis_results").insert(row).execute()
+                if getattr(ins, "error", None):
+                    logger.warning(f"DB insert failed for run_id={run_id}: {ins.error}")
+                else:
+                    # Optional: flip run to 'running' at first successful insert
+                    supabase.table("analysis_runs").update({"status": "running"}).eq("id", run_id).execute()
+            except Exception:
+                logger.exception("Failed to persist analysis_result")
+
+
     return payload
 
 # ----------------------------
@@ -823,13 +991,61 @@ async def analyze_fluorescence(
 @api.middleware("http")
 async def log_request_timing(request, call_next):
     t0 = time.perf_counter()
+    response = None
+    status_code = "?"
     try:
         response = await call_next(request)
+        status_code = getattr(response, "status_code", "?")
         return response
+    except Exception:
+        # Make sure we still log timing; keep original stack trace
+        status_code = "EXC"
+        raise
     finally:
         dt = time.perf_counter() - t0
-        clen = request.headers.get("content-length")
+        clen_req = request.headers.get("content-length")
+        # response can be None on exception; avoid touching response.headers
         logger.info(
-            f"[HTTP] {request.method} {request.url.path} -> {getattr(response, 'status_code', '?')} "
-            f"in {dt:.3f}s (Content-Length={clen})"
+            f"[HTTP] {request.method} {request.url.path} -> {status_code} "
+            f"in {dt:.3f}s (Content-Length={clen_req})"
         )
+
+
+
+# ----------------------------
+# RUNS
+# ----------------------------
+
+
+@api.post("/runs")
+def create_run(
+    name: str = Body(embed=True),
+    user_id: str | None = Body(default=None, embed=True),  # if you track per-user
+):
+    run_id = str(uuid4())
+    # Optional: client can supply run_id for idempotency; else we generate above.
+    data = {
+        "id": run_id,
+        "name": name,
+        "user_id": user_id,
+        "status": "pending",
+    }
+    res = supabase.table("analysis_runs").insert(data).execute()
+    if getattr(res, "error", None):
+        raise HTTPException(500, f"Failed to create run: {res.error.message}")
+    return {"run_id": run_id, "status": "pending"}
+
+
+class RunStatusBody(BaseModel):
+    status: Literal["running","completed","failed","canceled"]
+
+@api.post("/runs/{run_id}/status")
+def set_run_status(run_id: str, body: RunStatusBody):
+    status = body.status
+    patch = {"status": status}
+    if status in ("completed", "failed", "canceled"):
+        patch["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    res = supabase.table("analysis_runs").update(patch).eq("id", run_id).execute()
+    if hasattr(res, "error") and res.error:
+        raise HTTPException(500, f"DB error: {res.error}")
+    return {"ok": True}
