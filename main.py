@@ -968,7 +968,7 @@ async def analyze_fluorescence(
                 roi_url  = _upload_png_dataurl_to_storage(bucket, roi_path, payload["roi_image"])
                 mask_url = _upload_png_dataurl_to_storage(bucket, mask_path, payload["mask_image"])
 
-                row = _result_row_from_payload(run_id, filename, payload, analysis_type="brightfield")
+                row = _result_row_from_payload(run_id, filename, payload, analysis_type="fluorescence")
                 row["roi_image_path"] = roi_url or roi_path
                 row["mask_image_path"] = mask_url or mask_path
 
