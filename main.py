@@ -733,9 +733,9 @@ def brightfield_defaults() -> Dict[str, Any]:
 
 def fluorescence_defaults() -> Dict[str, Any]:
     return dict(
-        sigma_pre=10.0,
-        dilate_iter=25,
-        erode_iter=0,
+        sigma_pre=14,
+        dilate_iter=10,
+        erode_iter=8,
         min_area_px=1_000,
         max_area_px=10_000_000,
         min_circ=0.0,
