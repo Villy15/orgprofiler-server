@@ -67,10 +67,24 @@ logger.add(
     enqueue=True,
     backtrace=True,
     diagnose=True,
+    filter=lambda record: record["level"].name == "INFO",
     format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+           "<level>{level: <7}</level> | "
+           "{name}:{function}:{line} - <level>" \
+           "{message}</level>",
+)
+logger.add(
+    sys.stderr,
+    level="DEBUG",  
+    enqueue=True,
+    backtrace=True,
+    diagnose=True,
+    filter=lambda record: record["level"].name == "DEBUG",
+    format="<blue>{time:YYYY-MM-DD HH:mm:ss.SSS}</blue> | "
            "<level>{level: <7}</level> | "
            "{name}:{function}:{line} - <level>{message}</level>",
 )
+
 
 # ----------------------------
 # psutil + peak RSS helpers
@@ -771,10 +785,10 @@ async def analyze_brightfield(
     pixel_size_um: float = Query(brightfield_defaults()["pixel_size_um"], gt=0.0),
     return_images: bool = Query(brightfield_defaults()["return_images"]),
     profile: bool = Query(False),
-    day0_area: float | None = Form(None),
-    mean_day0_area: float | None = Form(None),
-    day0_area_by_organoid: str | None = Form(None),
+    day0_area: float | None = Query(None),
     run_id: str | None = Query(None),
+    day: str | None = Query(None),
+    organoid_number: str | None = Query(None),
 ) -> Dict[str, Any]:
     timings: Dict[str, float] = {}
 
@@ -783,7 +797,7 @@ async def analyze_brightfield(
     filename = file.filename or ""
     logger.info(f"Received BF file: {filename!r} ({len(data)} bytes)")
 
-    day, organoid_number = parse_day_organoid(filename)
+    day, organoid_number = day or None, organoid_number or None
 
     with timed(timings, "decode_rgb_s"), time_block("PIL decode + to RGB"):
         try:
@@ -811,25 +825,12 @@ async def analyze_brightfield(
     with timed(timings, "postprocess_s"), time_block("growth-rate compute"):
         area_value = float(payload["results"]["area"])
         growth_rate = None
-        if day == "00":
+        if day == 0 or day == "0":
             growth_rate = 1.0
         else:
-            baseline = None
-            if day0_area_by_organoid:
-                try:
-                    mapping = json.loads(day0_area_by_organoid)
-                    if isinstance(mapping, dict) and organoid_number:
-                        maybe = mapping.get(organoid_number)
-                        if isinstance(maybe, (int, float)):
-                            baseline = float(maybe)
-                except Exception:
-                    logger.warning("Invalid JSON for day0_area_by_organoid; ignoring")
-            if baseline is None and day0_area is not None:
-                baseline = float(day0_area)
-            if baseline is None and mean_day0_area is not None:
-                baseline = float(mean_day0_area)
-            if baseline and baseline > 0:
-                growth_rate = area_value / baseline
+            if day0_area is not None and day0_area > 0:
+                growth_rate = area_value / float(day0_area)
+
 
         payload["results"]["day"] = day
         payload["results"]["organoidNumber"] = organoid_number
@@ -884,10 +885,10 @@ async def analyze_fluorescence(
     area_filter_px: float = Query(fluorescence_defaults()["area_filter_px"], ge=0),
     return_images: bool = Query(fluorescence_defaults()["return_images"]),
     profile: bool = Query(False),
-    day0_area: float | None = Form(None),
-    mean_day0_area: float | None = Form(None),
-    day0_area_by_organoid: str | None = Form(None),
+    day0_area: float | None = Query(None),
     run_id: str | None = Query(None),
+    day: str | None = Query(None),
+    organoid_number: str | None = Query(None),
 ) -> Dict[str, Any]:
     timings: Dict[str, float] = {}
 
@@ -896,7 +897,7 @@ async def analyze_fluorescence(
     filename = file.filename or ""
     logger.info(f"Received FL file: {filename!r} ({len(data)} bytes)")
 
-    day, organoid_number = parse_day_organoid(filename)
+    day, organoid_number = day or None, organoid_number or None
 
     with timed(timings, "decode_rgb_s"), time_block("PIL decode + to RGB"):
         try:
@@ -921,25 +922,16 @@ async def analyze_fluorescence(
     with timed(timings, "postprocess_s"), time_block("growth-rate compute"):
         area_value = float(payload["results"]["area"])
         growth_rate = None
-        if day == "00":
+        
+        logger.debug(f"FL growth-rate compute | day={day} day0_area={day0_area} area_value={area_value}")
+
+        if day == 0 or day == "0":
             growth_rate = 1.0
         else:
-            baseline = None
-            if day0_area_by_organoid:
-                try:
-                    mapping = json.loads(day0_area_by_organoid)
-                    if isinstance(mapping, dict) and organoid_number:
-                        maybe = mapping.get(organoid_number)
-                        if isinstance(maybe, (int, float)):
-                            baseline = float(maybe)
-                except Exception:
-                    logger.warning("Invalid JSON for day0_area_by_organoid; ignoring")
-            if baseline is None and day0_area is not None:
-                baseline = float(day0_area)
-            if baseline is None and mean_day0_area is not None:
-                baseline = float(mean_day0_area)
-            if baseline and baseline > 0:
-                growth_rate = area_value / baseline
+            if day0_area is not None and day0_area > 0:
+                growth_rate = area_value / float(day0_area)
+
+        logger.debug(f"Computed growth_rate={growth_rate}")
 
         payload["results"]["day"] = day
         payload["results"]["organoidNumber"] = organoid_number
