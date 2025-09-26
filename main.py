@@ -883,6 +883,7 @@ async def analyze_fluorescence(
     dilate_iter: int = Query(fluorescence_defaults()["dilate_iter"], ge=0),
     erode_iter: int = Query(fluorescence_defaults()["erode_iter"], ge=0),
     area_filter_px: float = Query(fluorescence_defaults()["area_filter_px"], ge=0),
+    pixel_size_um: float = Query(fluorescence_defaults()["pixel_size_um"], gt=0.0),
     return_images: bool = Query(fluorescence_defaults()["return_images"]),
     profile: bool = Query(False),
     day0_area: float | None = Query(None),
